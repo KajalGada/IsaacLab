@@ -1,0 +1,347 @@
+<?xml version="1.0"?>
+<!--
+  UR5 robot with SCOOP end effector
+  Kinematic parameters sourced from:
+    Universal_Robots_ROS2_Description config/ur5/default_kinematics.yaml
+    Universal_Robots_ROS2_Description config/ur5/physical_parameters.yaml
+    Universal_Robots_ROS2_Description config/ur5/joint_limits.yaml
+    Universal_Robots_ROS2_Description config/ur5/visual_parameters.yaml
+
+  DH parameters:
+    d1=0.089159  a2=-0.425   a3=-0.39225
+    d4=0.10915   d5=0.09465  d6=0.0823
+
+  NOTE: base_link is REP-103 aligned (X+ forward).  A fixed joint rotates
+        pi about Z into the UR controller frame (base_link_inertia).
+        All revolute joint rotation axes are 0 0 1 in their child frame.
+-->
+<robot name="ur5_with_scoop">
+
+  <!-- =========================================================
+       MATERIALS
+  ========================================================= -->
+  <!-- =========================================================
+       LINK: base_link  (REP-103 root — Fixed Frame in RViz)
+       Empty link; inertia/visual live in base_link_inertia.
+  ========================================================= -->
+  <link name="base_link"/>
+
+  <!-- =========================================================
+       JOINT: base_link → base_link_inertia  (fixed, pi about Z)
+       Aligns REP-103 base_link with UR controller frame.
+  ========================================================= -->
+  <joint name="base_link-base_link_inertia" type="fixed">
+    <parent link="base_link"/>
+    <child link="base_link_inertia"/>
+    <origin xyz="0 0 0" rpy="0 0 3.141592653589793"/>
+  </joint>
+
+  <!-- =========================================================
+       LINK: base_link_inertia
+       Cylinder approx: mass=4.0 kg, radius=0.06 m, length=0.05 m
+       ixx=iyy = 0.0833333*m*(3r²+h²), izz = 0.5*m*r²
+  ========================================================= -->
+  <link name="base_link_inertia">
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 3.141592653589793"/>
+      <geometry>
+        <mesh filename="/home/gmr/isaac_lab/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/sand_scoop/assets/base.stl"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="4.0"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <inertia ixx="0.00443333156" ixy="0.0" ixz="0.0"
+               iyy="0.00443333156" iyz="0.0" izz="0.0072"/>
+    </inertial>
+  </link>
+
+  <!-- =========================================================
+       JOINT: shoulder_pan  (base_link_inertia → shoulder_link)
+       xyz: 0 0 d1=0.089159
+  ========================================================= -->
+  <joint name="shoulder_pan_joint" type="revolute">
+    <parent link="base_link_inertia"/>
+    <child link="shoulder_link"/>
+    <origin xyz="0 0 0.089159" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.2831853071795860" upper="6.2831853071795860"
+           effort="150.0" velocity="3.1415926535897931"/>
+    <dynamics damping="0" friction="0"/>
+  </joint>
+
+  <!-- =========================================================
+       LINK: shoulder_link
+       mass=3.7 kg; COG: 0 -0.00193 -0.02561; inertia rotation: 0 0 0
+  ========================================================= -->
+  <link name="shoulder_link">
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 3.141592653589793"/>
+      <geometry>
+        <mesh filename="/home/gmr/isaac_lab/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/sand_scoop/assets/shoulder.stl"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="3.7"/>
+      <origin xyz="0.0 -0.00193 -0.02561" rpy="0 0 0"/>
+      <inertia ixx="0.014972358333333331" ixy="0.0" ixz="0.0"
+               iyy="0.014972358333333331" iyz="0.0" izz="0.01040625"/>
+    </inertial>
+  </link>
+
+  <!-- =========================================================
+       JOINT: shoulder_lift  (shoulder_link → upper_arm_link)
+       xyz: 0 0 0   rpy: 1.5707963 0 0
+  ========================================================= -->
+  <joint name="shoulder_lift_joint" type="revolute">
+    <parent link="shoulder_link"/>
+    <child link="upper_arm_link"/>
+    <origin xyz="0 0 0" rpy="1.570796327 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.2831853071795860" upper="6.2831853071795860"
+           effort="150.0" velocity="3.1415926535897931"/>
+    <dynamics damping="0" friction="0"/>
+  </joint>
+
+  <!-- =========================================================
+       LINK: upper_arm_link
+       shoulder_offset=0.13585 m (visual origin z offset)
+       mass=8.393 kg; COG: -0.2125 0.0 0.11336; inertia rotation: 0 pi/2 0
+  ========================================================= -->
+  <link name="upper_arm_link">
+    <collision>
+      <origin xyz="0 0 0.13585" rpy="1.5707963267948966 0 -1.5707963267948966"/>
+      <geometry>
+        <mesh filename="/home/gmr/isaac_lab/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/sand_scoop/assets/upperarm.stl"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="8.393"/>
+      <origin xyz="-0.2125 0.0 0.11336" rpy="0 0 0"/>
+      <inertia ixx="0.0151074" ixy="0.0" ixz="0.0"
+               iyy="0.13388583541666665" iyz="0.0" izz="0.13388583541666665"/>
+    </inertial>
+  </link>
+
+  <!-- =========================================================
+       JOINT: elbow  (upper_arm_link → forearm_link)
+       xyz: a2=-0.425 0 0   rpy: 0 0 0
+  ========================================================= -->
+  <joint name="elbow_joint" type="revolute">
+    <parent link="upper_arm_link"/>
+    <child link="forearm_link"/>
+    <origin xyz="-0.425 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.1415926535897931" upper="3.1415926535897931"
+           effort="150.0" velocity="3.1415926535897931"/>
+    <dynamics damping="0" friction="0"/>
+  </joint>
+
+  <!-- =========================================================
+       LINK: forearm_link
+       elbow_offset=0.0165 m (visual origin z offset)
+       mass=2.33 kg; COG: -0.24225 0.0 0.0265; inertia rotation: 0 pi/2 0
+  ========================================================= -->
+  <link name="forearm_link">
+    <collision>
+      <origin xyz="0 0 0.0165" rpy="1.5707963267948966 0 -1.5707963267948966"/>
+      <geometry>
+        <mesh filename="/home/gmr/isaac_lab/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/sand_scoop/assets/forearm.stl"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="2.33"/>
+      <origin xyz="-0.24225 0.0 0.0265" rpy="0 0 0"/>
+      <inertia ixx="0.004095" ixy="0.0" ixz="0.0"
+               iyy="0.031216803515624995" iyz="0.0" izz="0.031216803515624995"/>
+    </inertial>
+  </link>
+
+  <!-- =========================================================
+       JOINT: wrist_1  (forearm_link → wrist_1_link)
+       xyz: a3=-0.39225 0 d4=0.10915   rpy: 0 0 0
+  ========================================================= -->
+  <joint name="wrist_1_joint" type="revolute">
+    <parent link="forearm_link"/>
+    <child link="wrist_1_link"/>
+    <origin xyz="-0.39225 0 0.10915" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.2831853071795860" upper="6.2831853071795860"
+           effort="28.0" velocity="3.1415926535897931"/>
+    <dynamics damping="0" friction="0"/>
+  </joint>
+
+  <!-- =========================================================
+       LINK: wrist_1_link
+       visual_offset=-0.093 m (z offset); visual rpy: pi/2 0 0
+       mass=1.219 kg; COG: 0.0 -0.01634 -0.0018; inertia rotation: 0 0 0
+  ========================================================= -->
+  <link name="wrist_1_link">
+    <collision>
+      <origin xyz="0 0 -0.093" rpy="1.5707963267948966 0 0"/>
+      <geometry>
+        <mesh filename="/home/gmr/isaac_lab/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/sand_scoop/assets/wrist1.stl"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="1.219"/>
+      <origin xyz="0.0 -0.01634 -0.0018" rpy="0 0 0"/>
+      <inertia ixx="0.002013889583333333" ixy="0.0" ixz="0.0"
+               iyy="0.002013889583333333" iyz="0.0" izz="0.0021942"/>
+    </inertial>
+  </link>
+
+  <!-- =========================================================
+       JOINT: wrist_2  (wrist_1_link → wrist_2_link)
+       xyz: 0 -d5=-0.09465 0   rpy: 1.5707963 0 0
+  ========================================================= -->
+  <joint name="wrist_2_joint" type="revolute">
+    <parent link="wrist_1_link"/>
+    <child link="wrist_2_link"/>
+    <origin xyz="0 -0.09465 0" rpy="1.570796327 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.2831853071795860" upper="6.2831853071795860"
+           effort="28.0" velocity="3.1415926535897931"/>
+    <dynamics damping="0" friction="0"/>
+  </joint>
+
+  <!-- =========================================================
+       LINK: wrist_2_link
+       visual_offset=-0.095 m; visual rpy: 0 0 0
+       mass=1.219 kg; COG: 0.0 0.01634 -0.0018; inertia rotation: 0 0 0
+  ========================================================= -->
+  <link name="wrist_2_link">
+    <collision>
+      <origin xyz="0 0 -0.095" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="/home/gmr/isaac_lab/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/sand_scoop/assets/wrist2.stl"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="1.219"/>
+      <origin xyz="0.0 0.01634 -0.0018" rpy="0 0 0"/>
+      <inertia ixx="0.0018310395833333333" ixy="0.0" ixz="0.0"
+               iyy="0.0018310395833333333" iyz="0.0" izz="0.0021942"/>
+    </inertial>
+  </link>
+
+  <!-- =========================================================
+       JOINT: wrist_3  (wrist_2_link → wrist_3_link)
+       xyz: 0 d6=0.0823 0   rpy: 1.5707963 pi pi
+  ========================================================= -->
+  <joint name="wrist_3_joint" type="revolute">
+    <parent link="wrist_2_link"/>
+    <child link="wrist_3_link"/>
+    <origin xyz="0 0.0823 0" rpy="1.5707963265897932 3.141592653589793 3.141592653589793"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.2831853071795860" upper="6.2831853071795860"
+           effort="28.0" velocity="3.1415926535897931"/>
+    <dynamics damping="0" friction="0"/>
+  </joint>
+
+  <!-- =========================================================
+       LINK: wrist_3_link
+       visual_offset=-0.0818 m; visual rpy: pi/2 0 0
+       mass=0.1879 kg; COG: 0.0 0.0 -0.001159; inertia rotation: 0 0 0
+  ========================================================= -->
+  <link name="wrist_3_link">
+    <collision>
+      <origin xyz="0 0 -0.0818" rpy="1.5707963267948966 0 0"/>
+      <geometry>
+        <mesh filename="/home/gmr/isaac_lab/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/sand_scoop/assets/wrist3.stl"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="0.1879"/>
+      <origin xyz="0.0 0.0 -0.001159" rpy="0 0 0"/>
+      <inertia ixx="8.062475833333332e-05" ixy="0.0" ixz="0.0"
+               iyy="8.062475833333332e-05" iyz="0.0" izz="1.3211718750000002e-04"/>
+    </inertial>
+  </link>
+
+  <!-- =========================================================
+       LINK: ft_frame  (force-torque sensor frame, empty)
+  ========================================================= -->
+  <link name="ft_frame"/>
+
+  <!-- =========================================================
+       JOINT: wrist_3_link → ft_frame  (fixed, pi about X)
+  ========================================================= -->
+  <joint name="wrist_3_link-ft_frame" type="fixed">
+    <parent link="wrist_3_link"/>
+    <child link="ft_frame"/>
+    <origin xyz="0 0 0" rpy="3.141592653589793 0 0"/>
+  </joint>
+
+  <!-- =========================================================
+       LINK: base  (ROS-Industrial 'base' frame, empty)
+  ========================================================= -->
+  <link name="base"/>
+
+  <!-- =========================================================
+       JOINT: base_link → base  (fixed, pi about Z — ROS-Industrial)
+  ========================================================= -->
+  <joint name="base_link-base_fixed_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="base"/>
+    <origin xyz="0 0 0" rpy="0 0 3.141592653589793"/>
+  </joint>
+
+  <!-- =========================================================
+       LINK: flange  (ROS-Industrial attachment point, empty)
+  ========================================================= -->
+  <link name="flange"/>
+
+  <!-- =========================================================
+       JOINT: wrist_3 → flange  (fixed)
+       rpy: 0 -pi/2 -pi/2
+  ========================================================= -->
+  <joint name="wrist_3-flange" type="fixed">
+    <parent link="wrist_3_link"/>
+    <child link="flange"/>
+    <origin xyz="0 0 0" rpy="0 -1.5707963267948966 -1.5707963267948966"/>
+  </joint>
+
+  <!-- =========================================================
+       LINK: tool0  (UR standard tool-centre-point frame, empty)
+  ========================================================= -->
+  <link name="tool0"/>
+
+  <!-- =========================================================
+       JOINT: flange → tool0  (fixed)
+       rpy: pi/2 0 pi/2  (X+ left, Y+ up, Z+ forward from flange face)
+  ========================================================= -->
+  <joint name="flange-tool0" type="fixed">
+    <parent link="flange"/>
+    <child link="tool0"/>
+    <origin xyz="0 0 0" rpy="1.5707963267948966 0 1.5707963267948966"/>
+  </joint>
+
+  <!-- =========================================================
+       JOINT: tool0 → scoop_link  (fixed end-effector mount)
+  ========================================================= -->
+  <joint name="tool0_scoop_joint" type="fixed">
+    <parent link="tool0"/>
+    <child link="scoop_link"/>
+    <origin xyz="0 0 0" rpy="1.5707963267948966 0 3.141592653589793"/>
+  </joint>
+
+  <!-- =========================================================
+       LINK: scoop_link  (SCOOP end effector — STL mesh)
+  ========================================================= -->
+  <link name="scoop_link">
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="/home/gmr/isaac_lab/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/sand_scoop/assets/ur5_scoop.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 0.05" rpy="0 0 0"/>
+      <mass value="0.5"/>
+      <inertia ixx="0.001" ixy="0.0" ixz="0.0"
+               iyy="0.001" iyz="0.0" izz="0.0005"/>
+    </inertial>
+  </link>
+
+</robot>
