@@ -55,14 +55,22 @@ class SandScoopEnvCfg:
     urdf_path: str = os.path.join(ASSETS_DIR, "ur5_with_scoop.urdf")
     """Absolute path to the UR5-with-scoop URDF (mesh paths already patched)."""
 
-    # Robot base pose (between the two sand containers).
+    # Robot base pose — original position facing +X toward the containers.
     robot_base_pos: tuple[float, float, float] = (-0.45, 0.0, 0.0)
+    robot_base_yaw: float = 0.0  # rotation around Z [rad]
 
-    # Home joint angles [shoulder_pan, lift, elbow, wrist1, wrist2, wrist3] in rad.
-    # Arm poised above source container, scoop pointing down.
+    # Home joint angles — hovers scoop at approx (−0.002, +0.251, 0.251) above source container.
+    # Found by FK search for robot at (−0.45, 0, 0), source_pos=(0.0, +0.25, 0.0).
     home_q: tuple[float, ...] = (
-        -0.27, -1.50, 1.70,
-        math.pi / 2, math.pi / 2, math.pi / 2,
+        0.2974, -0.9734, 1.3006,
+        1.4318, math.pi / 2, math.pi / 2,
+    )
+
+    # "In-sand" joint angles — scoop at approx (−0.001, +0.252, 0.041), at sand surface.
+    # Found by FK search for robot at (−0.45, 0, 0), source_pos=(0.0, +0.25, 0.0).
+    in_sand_q: tuple[float, ...] = (
+        0.2974, -0.7364, 1.4695,
+        0.9487, math.pi / 2, math.pi / 2,
     )
 
     # Joint position limits [rad] – used for clamping targets and limit penalties.
@@ -73,18 +81,24 @@ class SandScoopEnvCfg:
     joint_kp: float = 2000.0
     joint_kd: float = 100.0
 
+    # MuJoCo solver CCD iterations. Default (35) produces warnings with the
+    # UR5 mesh complexity; 100 silences them without a meaningful perf cost.
+    robot_ccd_iterations: int = 100
+
     # ------------------------------------------------------------------
     # Containers
     # ------------------------------------------------------------------
     # World-frame centre of each container's bottom face.
-    source_pos: tuple[float, float, float] = (0.05, 0.0, 0.0)
-    target_pos: tuple[float, float, float] = (0.60, 0.0, 0.0)
+    # Side-by-side in Y with a clear gap (~0.15 m) between walls.
+    source_pos: tuple[float, float, float] = (0.0,  0.25, 0.0)
+    target_pos: tuple[float, float, float] = (0.0, -0.25, 0.0)
 
     # Container dimensions (all in metres).
     box_w: float = 0.35
     box_d: float = 0.35
-    box_h: float = 0.12
-    wall_t: float = 0.02
+    box_h: float = 0.06
+    # Must be >= 2 * mpm_voxel_size so the MPM SDF resolves the wall (needs ≥2 grid cells).
+    wall_t: float = 0.04
     wall_mu: float = 0.6   # friction on container walls / bottom
 
     # ------------------------------------------------------------------
@@ -92,21 +106,24 @@ class SandScoopEnvCfg:
     # ------------------------------------------------------------------
     # Particle grid emitted above the source container bottom.
     # Coordinates are relative to source_pos.
-    mpm_emit_lo: tuple[float, float, float] = (-0.12, -0.12, 0.04)
+    mpm_emit_lo: tuple[float, float, float] = (-0.12, -0.12, 0.02)
     mpm_emit_hi: tuple[float, float, float] = (0.12,  0.12,  0.16)
-    mpm_voxel_size: float = 0.06          # coarser grid ≈ 200-300 particles
+    # Voxel size used for both particle emission spacing and the MPM solver grid.
+    # Must satisfy: particle_radius ≈ 0.25 * mpm_voxel_size for stable MPM.
+    # Must be <= wall_t so the MPM grid can resolve container walls.
+    mpm_voxel_size: float = 0.02
     mpm_particles_per_cell: int = 2
     mpm_grid_type: str = "sparse"         # "sparse" or "fixed"
 
-    # Kinetic-sand material parameters (tuned in simulation_newton_sand_v2.py).
+    # Kinetic-sand material parameters — matched to simulation_newton_sand_v1.py.
     sand_density: float = 1100.0          # kg/m³
-    sand_young_modulus: float = 1.5e5     # Pa
+    sand_young_modulus: float = 5e3       # Pa
     sand_poisson_ratio: float = 0.25
-    sand_friction: float = 1.2            # high inter-grain locking
-    sand_damping: float = 800.0           # kills elastic rebound
-    sand_yield_pressure: float = 300.0    # Pa
-    sand_yield_stress: float = 150.0      # Pa
-    sand_hardening: float = 5.0
+    sand_friction: float = 0.8
+    sand_damping: float = 3000.0
+    sand_yield_pressure: float = 50.0     # Pa
+    sand_yield_stress: float = 25.0       # Pa
+    sand_hardening: float = 0.5
     sand_air_drag: float = 1.0
 
     # Number of gravity-only frames to run at startup so particles settle.

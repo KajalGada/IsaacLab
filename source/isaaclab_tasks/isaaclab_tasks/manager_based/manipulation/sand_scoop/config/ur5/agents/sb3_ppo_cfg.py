@@ -15,6 +15,8 @@ Or import ``SB3_PPO_CFG`` into your own training script.
 
 from __future__ import annotations
 
+import torch.nn as nn
+
 SB3_PPO_CFG: dict = {
     # --- Algorithm ---
     "policy": "MlpPolicy",
@@ -32,8 +34,8 @@ SB3_PPO_CFG: dict = {
     "max_grad_norm": 0.5,
     # --- Network ---
     "policy_kwargs": {
-        "net_arch": [{"pi": [512, 256, 128], "vf": [512, 256, 128]}],
-        "activation_fn": "torch.nn.ELU",
+        "net_arch": {"pi": [512, 256, 128], "vf": [512, 256, 128]},
+        "activation_fn": nn.ELU,
     },
     # --- Total timesteps ---
     "total_timesteps": 5_000_000,
@@ -43,23 +45,22 @@ SB3_PPO_CFG: dict = {
 # Standalone entry-point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    import gymnasium as gym
     from stable_baselines3 import PPO
-    from stable_baselines3.common.env_util import make_vec_env
     from stable_baselines3.common.vec_env import SubprocVecEnv
-
-    import isaaclab_tasks.manager_based.manipulation.sand_scoop  # registers env  # noqa: F401
 
     cfg = dict(SB3_PPO_CFG)
     total_ts = cfg.pop("total_timesteps")
 
+    def _make_env():
+        # Import inside the subprocess so gym.register() runs in each worker.
+        import gymnasium as gym
+        import isaaclab_tasks.manager_based.manipulation.sand_scoop  # noqa: F401
+
+        return gym.make("Isaac-Sand-Scoop-UR5-v0")
+
     # Vectorise across CPU cores for parallel training
     n_envs = 4
-    vec_env = make_vec_env(
-        "Isaac-Sand-Scoop-UR5-v0",
-        n_envs=n_envs,
-        vec_env_cls=SubprocVecEnv,
-    )
+    vec_env = SubprocVecEnv([_make_env] * n_envs)
 
     model = PPO(env=vec_env, verbose=1, **cfg)
     model.learn(total_timesteps=total_ts)

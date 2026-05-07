@@ -63,6 +63,32 @@ class SandScoopDemo:
         self.obs, _ = self.env.reset()
         self._done = False
 
+        # Side A / Side B: same lift/elbow/wrist as in_sand_q, only shoulder_pan
+        # varies to sweep the scoop left↔right through the source container.
+        #   pan=+0.10 → scoop y≈0.16 (front of container)
+        #   pan=+0.55 → scoop y≈0.36 (back of container)
+        _,lift,elbow,w1,w2,w3 = cfg.in_sand_q
+        side_a = (0.10, lift, elbow, w1, w2, w3)
+        side_b = (0.55, lift, elbow, w1, w2, w3)
+
+        # Waypoints: (target_q, duration_in_demo_steps)
+        # 1 demo step ≈ policy_decimation * sim_dt = 3/60 s → 20 steps/s
+        # 2.5 s ≈ 50 steps,  1.5 s ≈ 30 steps
+        self._waypoints = [
+            (cfg.home_q, 50),   # hover above sand
+            (side_a,     30),   # descend into sand at side A
+            (side_b,     50),   # sweep → side B
+            (side_a,     50),   # sweep ← side A
+            (side_b,     50),   # sweep → side B
+            (side_a,     50),   # sweep ← side A
+            (side_b,     50),   # sweep → side B
+            (side_a,     50),   # sweep ← side A
+            (cfg.home_q, 30),   # lift out
+        ]
+        self._wp_idx    = 0
+        self._wp_frame  = 0
+        self._prev_q    = np.array(cfg.home_q, dtype=np.float64)
+
         # Wire Newton model/state into the viewer
         self.viewer.set_model(self.env.model)
         self.viewer.show_particles = True
@@ -91,14 +117,30 @@ class SandScoopDemo:
             self.obs, _ = self.env.reset()
             self._done = False
 
-        # Policy: trained model or small random exploration
+        # Policy: trained model, scripted waypoints, or random fallback
         if self._policy is not None:
             action, _ = self._policy.predict(self.obs, deterministic=True)
+            self.obs, _reward, self._done, _trunc, _info = self.env.step(action)
         else:
-            # Random policy with small magnitude so the arm moves gently
-            action = self.env.action_space.sample() * 0.15
+            # Scripted waypoint control with linear interpolation (v1.py style).
+            target_q, duration = self._waypoints[self._wp_idx]
+            t = min(self._wp_frame / duration, 1.0)
+            q_interp = (1.0 - t) * self._prev_q + t * np.array(target_q, dtype=np.float64)
 
-        self.obs, _reward, self._done, _trunc, _info = self.env.step(action)
+            q_np = self.env.control.joint_target_pos.numpy()
+            q_np[:self.env._robot_dof] = q_interp
+            self.env.control.joint_target_pos.assign(q_np)
+
+            dt = self.env.cfg.sim_dt / self.env.cfg.mpm_substeps
+            for _ in range(self.env.cfg.policy_decimation):
+                self.env._sim_frame(dt)
+            self.obs = self.env._get_obs()
+
+            self._wp_frame += 1
+            if self._wp_frame >= duration:
+                self._prev_q   = np.array(target_q, dtype=np.float64)
+                self._wp_frame = 0
+                self._wp_idx   = (self._wp_idx + 1) % len(self._waypoints)
         self.sim_time += self.env.cfg.sim_dt * self.env.cfg.policy_decimation
 
     def render(self) -> None:

@@ -157,9 +157,10 @@ class SandScoopEnv(gym.Env):
 
         # -- Robot -------------------------------------------------------
         # Robot is at -X; containers are at +X → no Z rotation needed.
+        base_rot = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), cfg.robot_base_yaw)  # type: ignore[arg-type]
         builder.add_urdf(
             cfg.urdf_path,
-            xform=wp.transform(wp.vec3(*cfg.robot_base_pos), wp.quat_identity()),
+            xform=wp.transform(wp.vec3(*cfg.robot_base_pos), base_rot),
             floating=False,
             enable_self_collisions=False,
         )
@@ -168,8 +169,8 @@ class SandScoopEnv(gym.Env):
         # Capture scoop body index from builder NOW (body_label only exists on
         # ModelBuilder before finalize; the Model object drops it).
         self._scoop_body_idx: int = next(
-            (i for i, n in enumerate(builder.body_label) if "scoop" in n.lower()),
-            len(builder.body_label) - 1,  # fallback: last body = scoop_link
+            (i for i, n in enumerate(builder.body_label) if n.split("/")[-1] == "scoop_link"),
+            len(builder.body_label) - 1,  # fallback: last body
         )
         print(f"[SandScoopEnv] scoop body index = {self._scoop_body_idx} "
               f"(label: {builder.body_label[self._scoop_body_idx]})")
@@ -182,9 +183,39 @@ class SandScoopEnv(gym.Env):
             builder.joint_target_ke[i] = cfg.joint_kp
             builder.joint_target_kd[i] = cfg.joint_kd
 
-        # -- Ground plane ------------------------------------------------
+        # -- Disable COLLIDE_PARTICLES for all URDF mesh shapes ------------
+        # High-polygon URDF meshes crash NanoVDB's PointsToGrid kernel in
+        # setup_collider — replaced by the explicit scoop sphere below.
+        # COLLIDE_SHAPES is kept so MuJoCo prevents the scoop from going
+        # through the robot floor (added below at z=-0.05).
+        for i in range(len(builder.shape_flags)):
+            if builder.shape_type[i] == int(newton.GeoType.MESH):
+                builder.shape_flags[i] &= ~int(newton.ShapeFlags.COLLIDE_PARTICLES)
+
+        # -- Scoop bowl collision sphere ---------------------------------
+        # Sphere placed at scoop_bowl_z_offset along the scoop link's local
+        # Z axis — matches the detection geometry used in _count_scoop().
+        builder.add_shape_sphere(
+            body=self._scoop_body_idx,
+            xform=wp.transform(wp.vec3(0.0, 0.0, cfg.scoop_bowl_z_offset), wp.quat_identity()),
+            radius=cfg.scoop_detect_radius,
+            # has_shape_collision=False: MuJoCo ignores this sphere so the arm
+            # is not pushed away from the ground; MPM still uses it for particles.
+            cfg=newton.ModelBuilder.ShapeConfig(mu=cfg.wall_mu, has_shape_collision=False),
+        )
+
+        # -- Ground planes -----------------------------------------------
+        # Particle floor at z=0: _project_outside keeps particles above it.
         builder.add_ground_plane(
-            cfg=newton.ModelBuilder.ShapeConfig(mu=0.5)
+            cfg=newton.ModelBuilder.ShapeConfig(mu=0.5, has_shape_collision=False)
+        )
+        # Invisible robot arm floor at z=-0.05: MuJoCo stops the scoop mesh
+        # from going through the floor without a second visible surface.
+        # Placed 5 cm below the particle floor so the arm can still reach
+        # the sand at z≈0 without being blocked at z≈0.22.
+        builder.add_shape_plane(
+            plane=(0.0, 0.0, 1.0, 0.05),
+            cfg=newton.ModelBuilder.ShapeConfig(mu=0.5, has_particle_collision=False, is_visible=False),
         )
 
         # -- Source container --------------------------------------------
@@ -203,6 +234,7 @@ class SandScoopEnv(gym.Env):
         # -- MPM solver --------------------------------------------------
         mpm_opts = SolverImplicitMPM.Config()
         mpm_opts.collider_velocity_mode = "finite_difference"
+        mpm_opts.voxel_size = cfg.mpm_voxel_size
 
         # Material parameters: some live on SolverImplicitMPM.Config, others on
         # model.mpm as per-particle Warp arrays.  Mirror the guard pattern from
@@ -226,7 +258,7 @@ class SandScoopEnv(gym.Env):
         self.mpm_solver = SolverImplicitMPM(self.model, mpm_opts)
 
         # -- Robot (MuJoCo) solver ---------------------------------------
-        self.robot_solver = SolverMuJoCo(self.model)
+        self.robot_solver = SolverMuJoCo(self.model, ccd_iterations=cfg.robot_ccd_iterations)
 
         # -- States ------------------------------------------------------
         self.state   = self.model.state()
@@ -235,8 +267,18 @@ class SandScoopEnv(gym.Env):
         # Forward kinematics: populate body_q from joint_q
         newton.eval_fk(self.model, self.state.joint_q, self.state.joint_qd, self.state)
 
-        # MPM collider setup (uses current body_q as reference)
+        # MPM collider setup (uses current body_q as reference).
+        # Register static shapes (body=-1) with default projection_threshold so
+        # _project_outside corrects slow boundary seepage on the ground/walls.
+        # Register the scoop sphere (scoop_body_idx) with projection_threshold=0
+        # so _project_outside NEVER violently ejects particles from inside the
+        # sphere — the MPM grid contact force handles gradual scoop interaction.
         self.mpm_solver.setup_collider(
+            collider_body_ids=[-1, self._scoop_body_idx],
+            # Static shapes: default seepage correction (0.01 * voxel_size ≈ 0.2 mm).
+            # Scoop sphere: 1 voxel threshold — only project deeply penetrating
+            # particles, avoiding the violent ejection from tiny default threshold.
+            collider_projection_threshold=[0.01 * cfg.mpm_voxel_size, cfg.mpm_voxel_size],
             body_mass=wp.zeros_like(self.model.body_mass),
             body_q=self.state.body_q,
         )
@@ -262,13 +304,13 @@ class SandScoopEnv(gym.Env):
         bh = cfg.box_h
         shape_cfg = newton.ModelBuilder.ShapeConfig(
             mu=cfg.wall_mu,
-            gap=0.001,
-            density=0.0,  # static (kinematic)
+            gap=0.01,
+            # Particle-only: _project_outside keeps sand inside walls,
+            # but the robot arm can pass through freely (no MuJoCo contact).
+            has_shape_collision=False,
         )
-        # bottom
-        builder.add_shape_box(body=-1, cfg=shape_cfg,
-            xform=wp.transform(wp.vec3(cx, cy, cz + wt * 0.5), wp.quat_identity()),
-            hx=hw, hy=hd, hz=wt * 0.5)
+        # No floor shape — the ground plane (analytical SDF) is the container floor.
+        # Box SDF needs ≥2 MPM voxels to be resolved; the 2cm floor was only 1 voxel.
         # front wall (−y)
         builder.add_shape_box(body=-1, cfg=shape_cfg,
             xform=wp.transform(wp.vec3(cx, cy - hd, cz + bh * 0.5), wp.quat_identity()),
@@ -432,6 +474,9 @@ class SandScoopEnv(gym.Env):
             contacts=None, control=None,
             dt=cfg.sim_dt,
         )
+        # Project particles back outside all colliders to prevent gradual boundary seepage.
+        # Grid-based MPM contact forces alone cannot maintain perfect separation over many steps.
+        self.mpm_solver._project_outside(self.state, self.state, cfg.sim_dt)
 
     # ------------------------------------------------------------------
     # Observations
@@ -523,7 +568,7 @@ class SandScoopEnv(gym.Env):
         eef_pos = body_q[self._scoop_body_idx, :3]
 
         sand_scoop  = float(self._count_scoop())  / max(self._num_particles, 1)
-        sand_target = float(self._count_target()) / max(self._num_particles, 1)
+        # sand_target = float(self._count_target()) / max(self._num_particles, 1)
 
         # Stage 1: approach source container
         src   = np.array(cfg.source_pos, dtype=np.float64)
@@ -534,19 +579,19 @@ class SandScoopEnv(gym.Env):
         # Stage 2: scoop reward (particles on scoop)
         reward += cfg.w_scoop * sand_scoop
 
-        # Stage 3: transport (only activates when scoop has material)
-        if sand_scoop > 0.05:
-            tgt   = np.array(cfg.target_pos, dtype=np.float64)
-            pour  = tgt + np.array([0.0, 0.0, cfg.box_h + 0.08])
-            dist_tgt = float(np.linalg.norm(eef_pos - pour))
-            reward += cfg.w_transport * math.exp(-dist_tgt * 5.0)
+        # Stage 3: transport — disabled, focusing on scooping only
+        # if sand_scoop > 0.05:
+        #     tgt   = np.array(cfg.target_pos, dtype=np.float64)
+        #     pour  = tgt + np.array([0.0, 0.0, cfg.box_h + 0.08])
+        #     dist_tgt = float(np.linalg.norm(eef_pos - pour))
+        #     reward += cfg.w_transport * math.exp(-dist_tgt * 5.0)
 
-        # Stage 4: pour reward (particles in target)
-        reward += cfg.w_pour * sand_target
+        # Stage 4: pour reward — disabled
+        # reward += cfg.w_pour * sand_target
 
-        # Stage 5: success bonus
-        if sand_target >= cfg.success_fraction:
-            reward += cfg.w_success
+        # Stage 5: success bonus — disabled
+        # if sand_target >= cfg.success_fraction:
+        #     reward += cfg.w_success
 
         # Regularisation: penalise large actions
         reward += cfg.w_action_penalty * float(np.sum(scaled_action ** 2))
