@@ -417,8 +417,7 @@ class DirectRLEnvWarp(DirectRLEnv):
 
         # check if we need to do rendering within the physics loop
         # note: checked here once to avoid multiple checks within the loop
-        _has_rtx = hasattr(self.sim, "has_rtx_sensors") and self.sim.has_rtx_sensors()
-        is_rendering = bool(self.sim.settings.get("/isaaclab/visualizer")) or _has_rtx
+        is_rendering = self.sim.is_rendering
 
         # perform physics stepping
         with Timer(name="physics_loop", msg="Physics loop took:", enable=DEBUG_TIMERS):
