@@ -94,3 +94,4 @@ imgui.ini
 isaacsim_ros1-6.0.0.0-cp312-none-manylinux_2_35_x86_64.whl
 isaacsim_ros1-6.0.0.0-cp312-none-manylinux_2_35_x86_64.whl.1
 source/isaaclab_experimental/changelog.d/fix-warp-env-is-rendering.rst
+source/isaaclab_tasks_experimental/changelog.d/
