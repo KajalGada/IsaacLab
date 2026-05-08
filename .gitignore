@@ -88,3 +88,10 @@ _build
 
 # Superpowers (Claude Code plugin artifacts)
 docs/superpowers/
+
+
+.claude/
+imgui.ini
+isaacsim_ros1-6.0.0.0-cp312-none-manylinux_2_35_x86_64.whl
+isaacsim_ros1-6.0.0.0-cp312-none-manylinux_2_35_x86_64.whl.1
+
