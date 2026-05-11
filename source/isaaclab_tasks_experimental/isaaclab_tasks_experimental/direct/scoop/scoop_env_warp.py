@@ -5,12 +5,13 @@
 
 """UR10 direct RL environment for sand scooping using Newton MuJoCo-Warp physics.
 
-Sand particles are excluded in this version; the task is wrist-tip reaching.
+Robot dynamics are handled by IsaacLab's MuJoCo-Warp backend. Sand particles are
+simulated in a separate Newton MPM model coupled one-way (robot body poses → MPM
+colliders each step). See sand_mpm.py for the MPM architecture.
 """
 
 from __future__ import annotations
 
-import torch
 import warp as wp
 from isaaclab_experimental.envs import DirectRLEnvWarp
 from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg
@@ -23,7 +24,10 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
+
 from isaaclab_assets.robots.universal_robots import UR10_CFG
+
+from .sand_mpm import UR10_PROXY_LINK_NAMES, SandMPMCfg, SandMPMHelper
 
 # Sand-box geometry (matches Newton reference script)
 _BOX_W = 0.35  # x full width
@@ -33,11 +37,11 @@ _BOX_FLOOR_T = 0.02  # floor / wall thickness
 
 # Static box pieces: (name, full_size_xyz, centre_xyz) — all env-local coords
 _BOX_PIECES: list[tuple[str, tuple, tuple]] = [
-    ("floor",      (_BOX_W,        _BOX_D,        _BOX_FLOOR_T),  (0.0,            0.0,            _BOX_FLOOR_T / 2)),
-    ("wall_neg_y", (_BOX_W,        _BOX_FLOOR_T,  _BOX_WALL_H),   (0.0,           -_BOX_D / 2,     _BOX_WALL_H / 2)),
-    ("wall_pos_y", (_BOX_W,        _BOX_FLOOR_T,  _BOX_WALL_H),   (0.0,            _BOX_D / 2,     _BOX_WALL_H / 2)),
-    ("wall_neg_x", (_BOX_FLOOR_T,  _BOX_D,        _BOX_WALL_H),   (-_BOX_W / 2,    0.0,            _BOX_WALL_H / 2)),
-    ("wall_pos_x", (_BOX_FLOOR_T,  _BOX_D,        _BOX_WALL_H),   ( _BOX_W / 2,    0.0,            _BOX_WALL_H / 2)),
+    ("floor", (_BOX_W, _BOX_D, _BOX_FLOOR_T), (0.0, 0.0, _BOX_FLOOR_T / 2)),
+    ("wall_neg_y", (_BOX_W, _BOX_FLOOR_T, _BOX_WALL_H), (0.0, -_BOX_D / 2, _BOX_WALL_H / 2)),
+    ("wall_pos_y", (_BOX_W, _BOX_FLOOR_T, _BOX_WALL_H), (0.0, _BOX_D / 2, _BOX_WALL_H / 2)),
+    ("wall_neg_x", (_BOX_FLOOR_T, _BOX_D, _BOX_WALL_H), (-_BOX_W / 2, 0.0, _BOX_WALL_H / 2)),
+    ("wall_pos_x", (_BOX_FLOOR_T, _BOX_D, _BOX_WALL_H), (_BOX_W / 2, 0.0, _BOX_WALL_H / 2)),
 ]
 
 # UR10 hovering above the sand box, arm facing -X (toward box at origin)
@@ -46,12 +50,12 @@ UR10_SCOOP_CFG = UR10_CFG.replace(
         pos=(0.5, 0.0, 0.0),
         rot=(0.0, 0.0, 1.0, 0.0),  # 180° around Z so arm faces the box at origin
         joint_pos={
-            "shoulder_pan_joint":  -0.27,
+            "shoulder_pan_joint": -0.27,
             "shoulder_lift_joint": -1.50,
-            "elbow_joint":          1.70,
-            "wrist_1_joint":        1.5708,
-            "wrist_2_joint":        1.5708,
-            "wrist_3_joint":        1.5708,
+            "elbow_joint": 1.70,
+            "wrist_1_joint": 1.5708,
+            "wrist_2_joint": 1.5708,
+            "wrist_3_joint": 1.5708,
         },
     ),
     actuators={
@@ -199,7 +203,8 @@ class ScoopWarpEnvCfg(DirectRLEnvCfg):
     decimation: int = 2
     action_space: int = 6
     # 6 scaled joint pos + 6 joint vel + 6 prev actions + 3 EE pos + 3 vec-to-target
-    observation_space: int = 24
+    # + 3 sand centroid + 1 sand mean_z + 1 sand displaced_fraction
+    observation_space: int = 29
     state_space: int = 0
 
     # Newton MuJoCo-Warp solver
@@ -243,9 +248,9 @@ class ScoopWarpEnvCfg(DirectRLEnvCfg):
         debug_vis=False,
     )
 
-    # scene
+    # scene — num_envs reduced from 512: MPM is significantly more expensive
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=512,
+        num_envs=16,
         env_spacing=2.0,
         replicate_physics=True,
         clone_in_fabric=True,
@@ -253,6 +258,9 @@ class ScoopWarpEnvCfg(DirectRLEnvCfg):
 
     # robot
     robot: ArticulationCfg = UR10_SCOOP_CFG.replace(prim_path="/World/envs/env_.*/Robot")
+
+    # sand MPM
+    sand: SandMPMCfg = SandMPMCfg()
 
     # task
     scoop_body_name: str = "wrist_3_link"
@@ -263,6 +271,8 @@ class ScoopWarpEnvCfg(DirectRLEnvCfg):
     dist_reward_scale: float = -1.0
     action_penalty_scale: float = -0.001
     alive_reward: float = 0.1
+    sand_capture_scale: float = 2.0
+    sand_capture_radius: float = 0.10  # [m] radius around wrist_3_link
 
     # observation scaling
     dof_vel_scale: float = 0.1
@@ -286,27 +296,49 @@ class ScoopWarpEnv(DirectRLEnvWarp):
         if self.cfg.scoop_body_name in self.robot.body_names:
             self._scoop_body_idx = self.robot.body_names.index(self.cfg.scoop_body_name)
         else:
-            # Fallback if scoop_link was merged during USD import
             self._scoop_body_idx = self.robot.body_names.index("wrist_3_link")
 
         # Warp views into Newton simulation data (zero-copy)
         self._joint_pos = self.robot.data.joint_pos.warp
         self._joint_vel = self.robot.data.joint_vel.warp
         self._body_pos_w = self.robot.data.body_pos_w.warp
+        self._body_quat_w = self.robot.data.body_quat_w.warp
         self._joint_limits = self.robot.data.soft_joint_pos_limits.warp
 
         # Env-local origins
         self._env_origins = wp.from_torch(self.scene.env_origins, dtype=wp.vec3f)
 
+        # Sand MPM — build separate Newton model and settle particles
+        robot_link_indices = [self.robot.body_names.index(name) for name in UR10_PROXY_LINK_NAMES]
+        self._sand = SandMPMHelper()
+        self._sand.build(
+            num_envs=self.num_envs,
+            env_origins=self.scene.env_origins,
+            robot_link_indices=robot_link_indices,
+            cfg=self.cfg.sand,
+            device=self.device,
+        )
+        self._sand.settle(
+            body_pos_w=self._body_pos_w,
+            body_quat_w=self._body_quat_w,
+            n_steps=self.cfg.sand.settle_steps,
+        )
+
+        # MPM control-step dt = physics dt × decimation
+        self._mpm_dt: float = self.cfg.sim.dt * self.cfg.decimation
+
+        # Pre-allocated CUDA arrays for log_points (avoids per-frame GPU allocation).
+        # log_points requires wp.array for radii/colors — Python float/tuple cause a kernel error.
+        _n_total = self._sand.get_all_particle_q().shape[0]
+        _r = float(self.cfg.sand.voxel_size * 0.5)
+        self._particle_radii = wp.full(_n_total, _r, dtype=wp.float32, device=self.device)
+        self._particle_colors = wp.full(_n_total, wp.vec3(0.85, 0.75, 0.45), dtype=wp.vec3, device=self.device)
+
         # Persistent warp buffers
         self._ee_pos_local = wp.zeros(self.num_envs, dtype=wp.vec3f, device=self.device)
         self._actions = wp.zeros((self.num_envs, self.cfg.action_space), dtype=wp.float32, device=self.device)
-        self._joint_targets = wp.zeros(
-            (self.num_envs, self.robot.num_joints), dtype=wp.float32, device=self.device
-        )
-        self._observations = wp.zeros(
-            (self.num_envs, self.cfg.observation_space), dtype=wp.float32, device=self.device
-        )
+        self._joint_targets = wp.zeros((self.num_envs, self.robot.num_joints), dtype=wp.float32, device=self.device)
+        self._observations = wp.zeros((self.num_envs, self.cfg.observation_space), dtype=wp.float32, device=self.device)
         self._rewards = wp.zeros(self.num_envs, dtype=wp.float32, device=self.device)
 
         # Per-env RNG state for reset noise
@@ -398,6 +430,12 @@ class ScoopWarpEnv(DirectRLEnvWarp):
             ],
             device=self.device,
         )
+        # dims [24:29]: sand centroid (3), mean_z (1), displaced_fraction (1)
+        self._sand.compute_obs(
+            env_origins=self._env_origins,
+            observations=self._observations,
+            obs_offset=24,
+        )
         return {"policy": self.torch_obs_buf}
 
     def _get_rewards(self) -> None:
@@ -416,8 +454,40 @@ class ScoopWarpEnv(DirectRLEnvWarp):
             ],
             device=self.device,
         )
+        # Add sand-capture reward on top of base reward
+        self._sand.add_capture_reward(
+            env_origins=self._env_origins,
+            ee_pos_local=self._ee_pos_local,
+            rewards=self._rewards,
+            radius=self.cfg.sand_capture_radius,
+            scale=self.cfg.sand_capture_scale,
+        )
+
+    def _post_step_visualize(self) -> None:
+        # MPM step runs outside the CUDA graph (sparse grid needs dynamic allocation).
+        # Proxy bodies were already updated inside _get_dones() during graph capture,
+        # so they already reflect the current robot pose when this runs.
+        self._sand.step(dt=self._mpm_dt)
+
+        # Render env_0 particles via Newton viewer's log_points with a CUDA Warp array.
+        # VisualizationMarkers routes through CPU numpy, causing a device-mismatch error
+        # in the GL instancer's Warp kernel. log_points accepts CUDA wp.array directly.
+        particle_q_all = self._sand.get_all_particle_q()
+        for viz in self.sim.visualizers:
+            viewer = getattr(viz, "_viewer", None)
+            if viewer is not None and hasattr(viewer, "log_points"):
+                viewer.log_points(
+                    "/sand_particles",
+                    particle_q_all,
+                    radii=self._particle_radii,
+                    colors=self._particle_colors,
+                )
 
     def _get_dones(self) -> None:
+        # Update proxy body transforms inside the graph (pure array writes — graph-safe).
+        # mpm_solver.step() is called in _post_step_visualize() outside the graph.
+        self._sand.update_proxy_bodies(self._body_pos_w, self._body_quat_w)
+
         self._update_ee_pos()
         wp.launch(
             _get_dones,
@@ -456,6 +526,14 @@ class ScoopWarpEnv(DirectRLEnvWarp):
         )
 
         self._update_ee_pos()
+
+        # Reset sand particles to settled snapshot for the masked envs
+        self._sand.reset(
+            env_mask=mask,
+            env_origins=self._env_origins,
+            body_pos_w=self._body_pos_w,
+            body_quat_w=self._body_quat_w,
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
