@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""UR10 direct RL environment for sand scooping using Newton MuJoCo-Warp physics.
+"""UR5+scoop direct RL environment for sand scooping using Newton MuJoCo-Warp physics.
 
 Robot dynamics are handled by IsaacLab's MuJoCo-Warp backend. Sand particles are
 simulated in a separate Newton MPM model coupled one-way (robot body poses → MPM
@@ -11,6 +11,8 @@ colliders each step). See sand_mpm.py for the MPM architecture.
 """
 
 from __future__ import annotations
+
+import os
 
 import warp as wp
 from isaaclab_experimental.envs import DirectRLEnvWarp
@@ -25,9 +27,10 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 
-from isaaclab_assets.robots.universal_robots import UR10_CFG
+from .sand_mpm import UR5_PROXY_LINK_NAMES, SandMPMCfg, SandMPMHelper
 
-from .sand_mpm import UR10_PROXY_LINK_NAMES, SandMPMCfg, SandMPMHelper
+_ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")
+_UR5_SCOOP_USD = os.path.join(_ASSETS_DIR, "ur5_with_scoop.usd")
 
 # Sand-box geometry (matches Newton reference script)
 _BOX_W = 0.35  # x full width
@@ -44,8 +47,22 @@ _BOX_PIECES: list[tuple[str, tuple, tuple]] = [
     ("wall_pos_x", (_BOX_FLOOR_T, _BOX_D, _BOX_WALL_H), (_BOX_W / 2, 0.0, _BOX_WALL_H / 2)),
 ]
 
-# UR10 hovering above the sand box, arm facing -X (toward box at origin)
-UR10_SCOOP_CFG = UR10_CFG.replace(
+# UR5+scoop hovering above the sand box.
+# Initial pose matches _Q_ABOVE from the Newton reference script.
+# Robot base at (0.5, 0, 0), rotated 180° around Z so the arm faces the box.
+UR5_SCOOP_CFG = ArticulationCfg(
+    spawn=sim_utils.UsdFileCfg(
+        usd_path=_UR5_SCOOP_USD,
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+            disable_gravity=False,
+            max_depenetration_velocity=5.0,
+        ),
+        articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+            enabled_self_collisions=False,
+            solver_position_iteration_count=8,
+            solver_velocity_iteration_count=0,
+        ),
+    ),
     init_state=ArticulationCfg.InitialStateCfg(
         pos=(0.5, 0.0, 0.0),
         rot=(0.0, 0.0, 1.0, 0.0),  # 180° around Z so arm faces the box at origin
@@ -60,7 +77,7 @@ UR10_SCOOP_CFG = UR10_CFG.replace(
     ),
     actuators={
         "arm": ImplicitActuatorCfg(
-            joint_names_expr=[".*"],
+            joint_names_expr=["shoulder_.*_joint", "elbow_joint", "wrist_.*_joint"],
             stiffness=2000.0,
             damping=100.0,
             effort_limit_sim=150.0,
@@ -257,13 +274,13 @@ class ScoopWarpEnvCfg(DirectRLEnvCfg):
     )
 
     # robot
-    robot: ArticulationCfg = UR10_SCOOP_CFG.replace(prim_path="/World/envs/env_.*/Robot")
+    robot: ArticulationCfg = UR5_SCOOP_CFG.replace(prim_path="/World/envs/env_.*/Robot")  # type: ignore[attr-defined]
 
     # sand MPM
     sand: SandMPMCfg = SandMPMCfg()
 
     # task
-    scoop_body_name: str = "wrist_3_link"
+    scoop_body_name: str = "scoop_link"
     # Target in env-local coordinates: centre of sand box at 5 cm depth
     target_pos: tuple = (0.0, 0.0, 0.05)
 
@@ -309,7 +326,7 @@ class ScoopWarpEnv(DirectRLEnvWarp):
         self._env_origins = wp.from_torch(self.scene.env_origins, dtype=wp.vec3f)
 
         # Sand MPM — build separate Newton model and settle particles
-        robot_link_indices = [self.robot.body_names.index(name) for name in UR10_PROXY_LINK_NAMES]
+        robot_link_indices = [self.robot.body_names.index(name) for name in UR5_PROXY_LINK_NAMES]
         self._sand = SandMPMHelper()
         self._sand.build(
             num_envs=self.num_envs,
@@ -352,6 +369,11 @@ class ScoopWarpEnv(DirectRLEnvWarp):
         # Torch-aliased buffers expected by DirectRLEnvWarp base class
         self.torch_obs_buf = wp.to_torch(self._observations)
         self.torch_reward_buf = wp.to_torch(self._rewards)
+
+        # Flag: reinit MPM collider body_q_prev the step AFTER a reset.
+        # setup_collider() cannot run inside the CUDA graph (does GPU→CPU copies),
+        # so we detect resets outside the graph and apply reinit one step later.
+        self._collider_reinit_pending = False
 
     # ------------------------------------------------------------------
     # Scene setup
@@ -464,6 +486,22 @@ class ScoopWarpEnv(DirectRLEnvWarp):
         )
 
     def _post_step_visualize(self) -> None:
+        # If a reset happened last step, reinit the MPM collider's body_q_prev NOW
+        # (before the MPM step) so finite_difference velocity = (hover − hover)/dt ≈ 0.
+        # Without this, the first post-reset MPM step would compute velocity from the
+        # end-of-episode pose to the new hover pose → huge impulse → particles fly.
+        # setup_collider() cannot run inside the CUDA graph (GPU→CPU copy), so we
+        # defer it here, one step after the actual reset.
+        if self._collider_reinit_pending:
+            self._sand.reinit_collider()
+            self._collider_reinit_pending = False
+
+        # Detect if any env was reset THIS step and schedule reinit for the next step.
+        # reset_buf is a Warp bool array written by _get_dones() inside the graph;
+        # reading it here (outside the graph) is safe and requires only a tiny D2H copy.
+        if wp.to_torch(self.reset_buf).any():
+            self._collider_reinit_pending = True
+
         # MPM step runs outside the CUDA graph (sparse grid needs dynamic allocation).
         # Proxy bodies were already updated inside _get_dones() during graph capture,
         # so they already reflect the current robot pose when this runs.

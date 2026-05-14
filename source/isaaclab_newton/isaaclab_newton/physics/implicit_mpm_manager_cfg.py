@@ -47,9 +47,7 @@ class ImplicitMPMSolverCfg(NewtonSolverCfg):
     warmstart_mode: Literal["none", "auto", "particles", "grid", "smoothed"] = "auto"
     """Warmstart mode for the rheology solver."""
 
-    collider_velocity_mode: Literal[
-        "forward", "backward", "instantaneous", "finite_difference"
-    ] = "forward"
+    collider_velocity_mode: Literal["forward", "backward", "instantaneous", "finite_difference"] = "forward"
     """How collider velocities are estimated for MPM contact."""
 
     voxel_size: float = 0.1

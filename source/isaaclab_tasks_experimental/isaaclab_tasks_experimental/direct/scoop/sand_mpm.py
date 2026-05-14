@@ -8,7 +8,7 @@
 Architecture
 ------------
 A separate Newton model holds only the sand particles and kinematic proxy bodies
-(capsules/spheres approximating UR10 links). Each control step:
+(capsules/spheres/box approximating UR5+scoop links). Each control step:
 
   1. Robot body transforms are copied from IsaacLab → proxy body_q.
   2. SolverImplicitMPM.step() advances the particles.
@@ -21,10 +21,10 @@ from __future__ import annotations
 import dataclasses
 import math
 
+import newton
 import numpy as np
 import torch
 import warp as wp
-import newton
 from newton.solvers import SolverImplicitMPM
 
 from isaaclab.utils import configclass
@@ -40,28 +40,29 @@ _BOX_FLOOR_T = 0.02
 
 # (name, half_extents_xyz, centre_xyz_env_local)
 _BOX_PIECES: list[tuple[str, tuple, tuple]] = [
-    ("floor",      (0.175, 0.175, 0.01),   (0.0,           0.0,            0.01)),
-    ("wall_neg_y", (0.175, 0.01,  0.025),  (0.0,          -_BOX_D / 2,    0.025)),
-    ("wall_pos_y", (0.175, 0.01,  0.025),  (0.0,           _BOX_D / 2,    0.025)),
-    ("wall_neg_x", (0.01,  0.175, 0.025),  (-_BOX_W / 2,   0.0,           0.025)),
-    ("wall_pos_x", (0.01,  0.175, 0.025),  ( _BOX_W / 2,   0.0,           0.025)),
+    ("floor", (0.175, 0.175, 0.01), (0.0, 0.0, 0.01)),
+    ("wall_neg_y", (0.175, 0.01, 0.025), (0.0, -_BOX_D / 2, 0.025)),
+    ("wall_pos_y", (0.175, 0.01, 0.025), (0.0, _BOX_D / 2, 0.025)),
+    ("wall_neg_x", (0.01, 0.175, 0.025), (-_BOX_W / 2, 0.0, 0.025)),
+    ("wall_pos_x", (0.01, 0.175, 0.025), (_BOX_W / 2, 0.0, 0.025)),
 ]
 
 # ---------------------------------------------------------------------------
-# Proxy body shapes for UR10 links
+# Proxy body shapes for UR5+scoop links
 # (link_name, shape, kwargs for builder.add_shape_*)
 # ---------------------------------------------------------------------------
 
-UR10_PROXY_LINK_NAMES: list[str] = [
+UR5_PROXY_LINK_NAMES: list[str] = [
     "shoulder_link",
     "upper_arm_link",
     "forearm_link",
     "wrist_1_link",
     "wrist_2_link",
     "wrist_3_link",
+    "scoop_link",
 ]
 
-_NUM_PROXY_PER_ENV = len(UR10_PROXY_LINK_NAMES)
+_NUM_PROXY_PER_ENV = len(UR5_PROXY_LINK_NAMES)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -73,7 +74,7 @@ class SandMPMCfg:
     """Configuration for the kinetic-sand MPM simulation."""
 
     # --- SolverImplicitMPM.Config fields ---
-    voxel_size: float = 0.02             # [m] coarser = faster; use 0.01 for production
+    voxel_size: float = 0.02  # [m] coarser = faster; use 0.01 for production
     grid_type: str = "sparse"
     solver: str = "gauss-seidel"
     transfer_scheme: str = "apic"
@@ -90,16 +91,18 @@ class SandMPMCfg:
     yield_stress: float = 25.0
     tensile_yield_ratio: float = 0.0
     hardening: float = 0.5
+    air_drag: float = 1.0  # particle air resistance (ref: 1.0)
+    critical_fraction: float = 0.0  # fracture compression threshold (ref: 0.0)
 
     # --- Particle spawn ---
-    density: float = 1100.0             # [kg/m³]
-    particles_per_cell: int = 2         # reduce for faster settling
-    emit_lo: tuple = (-0.13, -0.13, 0.03)
-    emit_hi: tuple = ( 0.13,  0.13, 0.18)
+    density: float = 1100.0  # [kg/m³]
+    particles_per_cell: int = 2  # reduce for faster settling
+    emit_lo: tuple = (-0.15, -0.15, 0.02)  # z_lo=0.02 keeps particles above the floor
+    emit_hi: tuple = (0.15, 0.15, 0.20)  # z_hi=0.20 keeps robot links above spawn volume
     initial_jitter: float = 0.5
 
     # --- Startup settling ---
-    settle_steps: int = 120             # MPM steps at episode init
+    settle_steps: int = 120  # MPM steps at episode init
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +118,7 @@ def _update_proxy_body_q(
     num_proxy_per_env: wp.int32,
     body_q: wp.array(dtype=wp.transformf),
 ):
-    """Copy current UR10 link transforms into the sand model's proxy body_q."""
+    """Copy current UR5+scoop link transforms into the sand model's proxy body_q."""
     env_id, link_id = wp.tid()
     robot_body_idx = robot_link_indices[link_id]
     proxy_idx = env_id * num_proxy_per_env + link_id
@@ -181,7 +184,7 @@ def _compute_sand_obs(
     observations[env_id, obs_offset + 0] = cx / fn
     observations[env_id, obs_offset + 1] = cy / fn
     observations[env_id, obs_offset + 2] = cz / fn
-    observations[env_id, obs_offset + 3] = cz / fn   # mean_z == centroid_z
+    observations[env_id, obs_offset + 3] = cz / fn  # mean_z == centroid_z
     observations[env_id, obs_offset + 4] = wp.float32(displaced) / fn
 
 
@@ -265,30 +268,36 @@ class SandMPMHelper:
                 wp.vec3(0.0, 0.0, 0.0),
                 wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), math.pi / 2),
             )
-            for link_id in range(len(UR10_PROXY_LINK_NAMES)):
+            for link_id in range(len(UR5_PROXY_LINK_NAMES)):
                 body_idx = builder.add_body(mass=0.0)
                 if link_id == 0:  # shoulder_link
                     builder.add_shape_sphere(body=body_idx, radius=0.055)
-                elif link_id == 1:  # upper_arm_link — capsule along X
+                elif link_id == 1:  # upper_arm_link — UR5 A2=0.425 m along X
                     builder.add_shape_capsule(
                         body=body_idx,
                         radius=0.04,
-                        half_height=0.18,
+                        half_height=0.21,
                         xform=_x_axis_capsule_xform,
                     )
-                elif link_id == 2:  # forearm_link — capsule along X
+                elif link_id == 2:  # forearm_link — UR5 A3=0.39225 m along X
                     builder.add_shape_capsule(
                         body=body_idx,
                         radius=0.035,
-                        half_height=0.16,
+                        half_height=0.20,
                         xform=_x_axis_capsule_xform,
                     )
-                elif link_id == 3:  # wrist_1_link
+                elif link_id == 3 or link_id == 4:  # wrist_1_link
                     builder.add_shape_sphere(body=body_idx, radius=0.038)
-                elif link_id == 4:  # wrist_2_link
-                    builder.add_shape_sphere(body=body_idx, radius=0.038)
-                else:  # wrist_3_link
+                elif link_id == 5:  # wrist_3_link
                     builder.add_shape_sphere(body=body_idx, radius=0.032)
+                else:  # scoop_link — flat box (15 cm × 12 cm × 3 cm) offset 5 cm along Z
+                    builder.add_shape_box(
+                        body=body_idx,
+                        hx=0.075,
+                        hy=0.060,
+                        hz=0.015,
+                        xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()),
+                    )
 
             # ---- Static box container --------------------------------------
             box_cfg = newton.ModelBuilder.ShapeConfig(mu=0.6, gap=cfg.voxel_size)
@@ -310,15 +319,11 @@ class SandMPMHelper:
             # ---- Particle grid ---------------------------------------------
             emit_lo = np.array(cfg.emit_lo, dtype=np.float32) + offset
             emit_hi = np.array(cfg.emit_hi, dtype=np.float32) + offset
-            particle_res = np.ceil(
-                cfg.particles_per_cell * (emit_hi - emit_lo) / cfg.voxel_size
-            ).astype(int)
+            particle_res = np.ceil(cfg.particles_per_cell * (emit_hi - emit_lo) / cfg.voxel_size).astype(int)
             cell_size = (emit_hi - emit_lo) / particle_res
             radius_p = float(np.max(cell_size) * 0.5)
             mass_p = float(np.prod(cell_size) * cfg.density)
-            n_particles = int(
-                (particle_res[0] + 1) * (particle_res[1] + 1) * (particle_res[2] + 1)
-            )
+            n_particles = int((particle_res[0] + 1) * (particle_res[1] + 1) * (particle_res[2] + 1))
 
             env_particle_starts.append(len(particle_env_ids))
             env_particle_counts.append(n_particles)
@@ -341,7 +346,7 @@ class SandMPMHelper:
 
         # ---- Finalize model ------------------------------------------------
         self._model = builder.finalize(device=device)
-        self._model.set_gravity([0.0, 0.0, -9.81])
+        self._model.set_gravity([0.0, 0.0, -10.0])
 
         # Populate SolverImplicitMPM.Config from cfg fields
         opts = SolverImplicitMPM.Config()
@@ -357,8 +362,11 @@ class SandMPMHelper:
 
         self._state = self._model.state()
         self._solver = SolverImplicitMPM(self._model, opts)
+        # Cache zero body-mass array used in every setup_collider() call.
+        # All proxy bodies are kinematic (mass=0) from the MPM's perspective.
+        self._zero_body_mass = wp.zeros_like(self._model.body_mass)
         self._solver.setup_collider(
-            body_mass=wp.zeros_like(self._model.body_mass),
+            body_mass=self._zero_body_mass,
             body_q=self._state.body_q,
         )
 
@@ -374,10 +382,7 @@ class SandMPMHelper:
         self._snapshot_q = wp.zeros(total, dtype=wp.vec3f, device=device)
         self._snapshot_qd = wp.zeros(total, dtype=wp.vec3f, device=device)
 
-        print(
-            f"[SandMPMHelper] Built: {num_envs} envs, "
-            f"{total} particles total ({total // num_envs} per env)"
-        )
+        print(f"[SandMPMHelper] Built: {num_envs} envs, {total} particles total ({total // num_envs} per env)")
 
     def settle(
         self,
@@ -393,6 +398,14 @@ class SandMPMHelper:
             n_steps: Number of MPM steps (~2 s at 60 Hz).
         """
         self.update_proxy_bodies(body_pos_w, body_quat_w)
+        # Re-initialize body_q_prev to the hover pose so finite_difference velocity
+        # starts at zero on the first MPM step. Without this, body_q_prev would be
+        # the origin (set when setup_collider() was called in build()), and the first
+        # step would compute a ~18 m/s impulse (origin → hover) that explodes the pile.
+        self._solver.setup_collider(
+            body_mass=self._zero_body_mass,
+            body_q=self._state.body_q,
+        )
         dt = 1.0 / 60.0
         for _ in range(n_steps):
             self._solver.step(self._state, self._state, contacts=None, control=None, dt=dt)
@@ -468,8 +481,29 @@ class SandMPMHelper:
             ],
             device=self._device,
         )
-        # Re-sync proxy bodies so MPM doesn't see stale positions on next step
+        # Re-sync proxy bodies so the restored particles see correct collider positions.
+        # setup_collider() cannot be called here — this runs inside a CUDA graph and
+        # setup_collider() does a GPU→CPU copy (shape_flags.numpy()) which is illegal
+        # during graph capture. The caller handles reinit via reinit_collider().
         self.update_proxy_bodies(body_pos_w, body_quat_w)
+
+    def reinit_collider(self) -> None:
+        """Reset the solver's internal body_q_prev to the current proxy body positions.
+
+        Must be called **outside** any CUDA graph after proxy bodies have been updated.
+        This prevents a finite_difference velocity spike when body positions jump
+        discontinuously — e.g. the first MPM step after an episode reset, where the
+        robot teleports from its end-of-episode pose to the new hover pose.
+
+        Call pattern in scoop_env_warp._post_step_visualize():
+            if reset_happened_last_step:
+                self._sand.reinit_collider()   # body_q_prev = current hover pose
+            self._sand.step(...)               # velocity = (hover+δ − hover)/dt ≈ 0 ✓
+        """
+        self._solver.setup_collider(
+            body_mass=self._zero_body_mass,
+            body_q=self._state.body_q,
+        )
 
     def compute_obs(
         self,
@@ -487,7 +521,7 @@ class SandMPMHelper:
                 env_origins,
                 self._env_particle_start,
                 self._env_particle_count,
-                0.02,   # displaced_threshold [m]
+                0.02,  # displaced_threshold [m]
                 observations,
                 obs_offset,
             ],

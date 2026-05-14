@@ -10,9 +10,6 @@ from __future__ import annotations
 import logging
 from dataclasses import fields
 
-import numpy as np
-import warp as wp
-
 from newton import Model
 from newton.solvers import SolverImplicitMPM
 

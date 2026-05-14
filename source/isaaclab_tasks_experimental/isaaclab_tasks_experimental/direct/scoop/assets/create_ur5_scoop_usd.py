@@ -10,7 +10,8 @@ Run once to generate the asset::
     ./isaaclab.sh -p .../direct/scoop/assets/create_ur5_scoop_usd.py
 
 The resulting USD uses:
-  - primitive collision shapes (capsules/spheres/cylinder) — no mesh dependency
+  - primitive collision shapes (capsules/spheres/cylinder) — no mesh dependency for physics
+  - STL visual meshes with per-link colors embedded from the assets directory
   - mass/inertia values from the original URDF
   - drive gains matching the Newton reference script (ke=2000, kd=100)
   - a fixed joint from world to base_link so the robot is fixed-base
@@ -18,8 +19,9 @@ The resulting USD uses:
 
 import math
 import os
+import struct
 
-from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _USD_PATH = os.path.join(_DIR, "ur5_with_scoop.usd")
@@ -34,6 +36,34 @@ D6 = 0.0823
 
 PI = math.pi
 
+# ---------------------------------------------------------------------------
+# Per-link color palette (RGB, linear)
+# ---------------------------------------------------------------------------
+
+_LINK_COLORS: dict[str, tuple[float, float, float]] = {
+    "base_link": (0.29, 0.29, 0.29),  # UR dark grey #4A4A4A
+    "shoulder_link": (0.0, 0.56, 0.85),  # UR blue #009FE3
+    "upper_arm_link": (0.29, 0.29, 0.29),  # UR dark grey
+    "forearm_link": (0.29, 0.29, 0.29),  # UR dark grey
+    "wrist_1_link": (0.0, 0.56, 0.85),  # UR blue
+    "wrist_2_link": (0.0, 0.56, 0.85),  # UR blue
+    "wrist_3_link": (0.0, 0.56, 0.85),  # UR blue
+    "scoop_link": (0.52, 0.52, 0.52),  # light grey (aluminium)
+}
+
+# (stl_filename, trans_xyz_m, rpy_rad, uniform_scale)
+# Transforms match the URDF <collision><origin> for each link.
+# The scoop STL is in millimetres, so scale=0.001.
+_LINK_STL_VISUALS: dict[str, tuple[str, tuple, tuple, float]] = {
+    "base_link": ("base.stl", (0.0, 0.0, 0.0), (0.0, 0.0, PI), 1.0),
+    "shoulder_link": ("shoulder.stl", (0.0, 0.0, 0.0), (0.0, 0.0, PI), 1.0),
+    "upper_arm_link": ("upperarm.stl", (0.0, 0.0, 0.13585), (PI / 2, 0.0, -PI / 2), 1.0),
+    "forearm_link": ("forearm.stl", (0.0, 0.0, 0.0165), (PI / 2, 0.0, -PI / 2), 1.0),
+    "wrist_1_link": ("wrist1.stl", (0.0, 0.0, -0.093), (PI / 2, 0.0, 0.0), 1.0),
+    "wrist_2_link": ("wrist2.stl", (0.0, 0.0, -0.095), (0.0, 0.0, 0.0), 1.0),
+    "wrist_3_link": ("wrist3.stl", (0.0, 0.0, -0.0818), (PI / 2, 0.0, 0.0), 1.0),
+    "scoop_link": ("ur5_scoop.stl", (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), 0.001),
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -177,6 +207,80 @@ def _fixed_joint(
     return jnt
 
 
+def _read_binary_stl(path: str) -> tuple[list[Gf.Vec3f], list[int]]:
+    """Parse a binary STL file and return (points, face_vertex_indices).
+
+    Returns unshared vertices — 3 points per triangle in order — and sequential
+    face_vertex_indices [0,1,2, 3,4,5, ...].  Scale is applied by the caller.
+    """
+    with open(path, "rb") as f:
+        header = f.read(80)  # noqa: F841 — skip header
+        (n_tri,) = struct.unpack_from("<I", f.read(4))
+        raw = f.read(n_tri * 50)
+
+    points: list[Gf.Vec3f] = []
+    face_indices: list[int] = []
+    offset = 0
+    for i in range(n_tri):
+        # 12 bytes normal (skip) + 36 bytes vertices + 2 bytes attribute (skip)
+        offset += 12  # skip normal
+        vx0, vy0, vz0 = struct.unpack_from("<fff", raw, offset)
+        offset += 12
+        vx1, vy1, vz1 = struct.unpack_from("<fff", raw, offset)
+        offset += 12
+        vx2, vy2, vz2 = struct.unpack_from("<fff", raw, offset)
+        offset += 12
+        offset += 2  # skip attribute byte count
+        base = i * 3
+        points.append(Gf.Vec3f(vx0, vy0, vz0))
+        points.append(Gf.Vec3f(vx1, vy1, vz1))
+        points.append(Gf.Vec3f(vx2, vy2, vz2))
+        face_indices.extend([base, base + 1, base + 2])
+
+    return points, face_indices
+
+
+def _create_material(stage: Usd.Stage, mat_path: str, rgb: tuple) -> UsdShade.Material:
+    """Create a UsdPreviewSurface material with the given diffuse color."""
+    mat = UsdShade.Material.Define(stage, mat_path)
+    shader = UsdShade.Shader.Define(stage, f"{mat_path}/Shader")
+    shader.CreateIdAttr("UsdPreviewSurface")
+    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*rgb))
+    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.4)
+    shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.1)
+    mat.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+    return mat
+
+
+def _add_visual_mesh(
+    stage: Usd.Stage,
+    parent_path: str,
+    name: str,
+    points: list[Gf.Vec3f],
+    face_indices: list[int],
+    mat: UsdShade.Material,
+    trans: tuple = (0.0, 0.0, 0.0),
+    rpy: tuple = (0.0, 0.0, 0.0),
+    scale: float = 1.0,
+) -> UsdGeom.Mesh:
+    """Create a visual-only mesh prim with a transform and bound material."""
+    mesh = UsdGeom.Mesh.Define(stage, f"{parent_path}/{name}")
+    n_tri = len(face_indices) // 3
+    mesh.CreateFaceVertexCountsAttr([3] * n_tri)
+    mesh.CreateFaceVertexIndicesAttr(face_indices)
+    scaled = [Gf.Vec3f(p[0] * scale, p[1] * scale, p[2] * scale) for p in points]
+    mesh.CreatePointsAttr(scaled)
+    mesh.SetNormalsInterpolation(UsdGeom.Tokens.faceVarying)
+    # Transform
+    if trans != (0.0, 0.0, 0.0):
+        mesh.AddTranslateOp().Set(Gf.Vec3d(*trans))
+    if rpy != (0.0, 0.0, 0.0):
+        mesh.AddOrientOp().Set(_rpy_to_quatf(*rpy))
+    # Bind material
+    UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim()).Bind(mat)
+    return mesh
+
+
 # ---------------------------------------------------------------------------
 # Main builder
 # ---------------------------------------------------------------------------
@@ -194,13 +298,46 @@ def build(usd_path: str = _USD_PATH) -> None:
     J = f"{ROOT}/joints"
     UsdGeom.Scope.Define(stage, J)
 
+    # Materials scope
+    LOOKS = f"{ROOT}/Looks"
+    UsdGeom.Scope.Define(stage, LOOKS)
+    materials: dict[str, UsdShade.Material] = {}
+    for link_name, rgb in _LINK_COLORS.items():
+        mat_name = link_name.replace("_link", "") + "_mat"
+        materials[link_name] = _create_material(stage, f"{LOOKS}/{mat_name}", rgb)
+
     # ------------------------------------------------------------------
-    # Links — primitive collision shapes, URDF mass/inertia
+    # Helper: add visual mesh from STL for a given link
+    # ------------------------------------------------------------------
+
+    def _attach_visual(link_name: str) -> None:
+        stl_file, trans, rpy, scale = _LINK_STL_VISUALS[link_name]
+        stl_path = os.path.join(_DIR, stl_file)
+        if not os.path.isfile(stl_path):
+            print(f"  [WARN] STL not found, skipping visual for {link_name}: {stl_path}")
+            return
+        pts, fidx = _read_binary_stl(stl_path)
+        _add_visual_mesh(
+            stage,
+            f"{ROOT}/{link_name}",
+            "visual",
+            pts,
+            fidx,
+            materials[link_name],
+            trans=trans,
+            rpy=rpy,
+            scale=scale,
+        )
+
+    # ------------------------------------------------------------------
+    # Links — primitive collision shapes (invisible), URDF mass/inertia
     # ------------------------------------------------------------------
 
     # base_link_inertia (merged with base_link for simplicity)
     _add_link(stage, f"{ROOT}/base_link", mass=4.0, diag_inertia=(0.00443, 0.00443, 0.0072))
-    _add_cylinder(stage, f"{ROOT}/base_link", "col", radius=0.06, height=0.05)
+    col = _add_cylinder(stage, f"{ROOT}/base_link", "col", radius=0.06, height=0.05)
+    UsdGeom.Imageable(col.GetPrim()).MakeInvisible()
+    _attach_visual("base_link")
 
     # shoulder_link
     _add_link(
@@ -210,7 +347,9 @@ def build(usd_path: str = _USD_PATH) -> None:
         diag_inertia=(0.01497, 0.01497, 0.01041),
         cog=(0.0, -0.00193, -0.02561),
     )
-    _add_sphere(stage, f"{ROOT}/shoulder_link", "col", radius=0.055)
+    col = _add_sphere(stage, f"{ROOT}/shoulder_link", "col", radius=0.055)
+    UsdGeom.Imageable(col.GetPrim()).MakeInvisible()
+    _attach_visual("shoulder_link")
 
     # upper_arm_link — capsule along X (arm extends in -X from shoulder)
     _add_link(
@@ -220,15 +359,21 @@ def build(usd_path: str = _USD_PATH) -> None:
         diag_inertia=(0.01511, 0.13389, 0.13389),
         cog=(-0.2125, 0.0, 0.11336),
     )
-    _add_capsule(
+    col = _add_capsule(
         stage, f"{ROOT}/upper_arm_link", "col", radius=0.04, height=0.36, axis="X", trans=(-0.2125, 0.0, 0.13585)
     )
+    UsdGeom.Imageable(col.GetPrim()).MakeInvisible()
+    _attach_visual("upper_arm_link")
 
     # forearm_link — capsule along X
     _add_link(
         stage, f"{ROOT}/forearm_link", mass=2.33, diag_inertia=(0.004095, 0.03122, 0.03122), cog=(-0.24225, 0.0, 0.0265)
     )
-    _add_capsule(stage, f"{ROOT}/forearm_link", "col", radius=0.035, height=0.32, axis="X", trans=(-0.196, 0.0, 0.0165))
+    col = _add_capsule(
+        stage, f"{ROOT}/forearm_link", "col", radius=0.035, height=0.32, axis="X", trans=(-0.196, 0.0, 0.0165)
+    )
+    UsdGeom.Imageable(col.GetPrim()).MakeInvisible()
+    _attach_visual("forearm_link")
 
     # wrist_1_link
     _add_link(
@@ -238,7 +383,9 @@ def build(usd_path: str = _USD_PATH) -> None:
         diag_inertia=(0.002014, 0.002014, 0.002194),
         cog=(0.0, -0.01634, -0.0018),
     )
-    _add_sphere(stage, f"{ROOT}/wrist_1_link", "col", radius=0.038, trans=(0.0, 0.0, -0.093))
+    col = _add_sphere(stage, f"{ROOT}/wrist_1_link", "col", radius=0.038, trans=(0.0, 0.0, -0.093))
+    UsdGeom.Imageable(col.GetPrim()).MakeInvisible()
+    _attach_visual("wrist_1_link")
 
     # wrist_2_link
     _add_link(
@@ -248,17 +395,23 @@ def build(usd_path: str = _USD_PATH) -> None:
         diag_inertia=(0.001831, 0.001831, 0.002194),
         cog=(0.0, 0.01634, -0.0018),
     )
-    _add_sphere(stage, f"{ROOT}/wrist_2_link", "col", radius=0.038, trans=(0.0, 0.0, -0.095))
+    col = _add_sphere(stage, f"{ROOT}/wrist_2_link", "col", radius=0.038, trans=(0.0, 0.0, -0.095))
+    UsdGeom.Imageable(col.GetPrim()).MakeInvisible()
+    _attach_visual("wrist_2_link")
 
     # wrist_3_link
     _add_link(
         stage, f"{ROOT}/wrist_3_link", mass=0.1879, diag_inertia=(8.06e-5, 8.06e-5, 1.32e-4), cog=(0.0, 0.0, -0.001159)
     )
-    _add_sphere(stage, f"{ROOT}/wrist_3_link", "col", radius=0.032, trans=(0.0, 0.0, -0.082))
+    col = _add_sphere(stage, f"{ROOT}/wrist_3_link", "col", radius=0.032, trans=(0.0, 0.0, -0.082))
+    UsdGeom.Imageable(col.GetPrim()).MakeInvisible()
+    _attach_visual("wrist_3_link")
 
     # scoop_link — flat box approximating the scoop paddle (15 cm × 12 cm × 3 cm)
     _add_link(stage, f"{ROOT}/scoop_link", mass=0.5, diag_inertia=(0.001, 0.001, 0.0005), cog=(0.0, 0.0, 0.05))
-    _add_cube(stage, f"{ROOT}/scoop_link", "col", size=(0.15, 0.12, 0.03), trans=(0.0, 0.0, 0.05))
+    col = _add_cube(stage, f"{ROOT}/scoop_link", "col", size=(0.15, 0.12, 0.03), trans=(0.0, 0.0, 0.05))
+    UsdGeom.Imageable(col.GetPrim()).MakeInvisible()
+    _attach_visual("scoop_link")
 
     # ------------------------------------------------------------------
     # Joints
