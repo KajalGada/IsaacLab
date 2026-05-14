@@ -74,7 +74,7 @@ class SandMPMCfg:
     """Configuration for the kinetic-sand MPM simulation."""
 
     # --- SolverImplicitMPM.Config fields ---
-    voxel_size: float = 0.02  # [m] coarser = faster; use 0.01 for production
+    voxel_size: float = 0.01  # [m]
     grid_type: str = "sparse"
     solver: str = "gauss-seidel"
     transfer_scheme: str = "apic"
@@ -86,7 +86,7 @@ class SandMPMCfg:
     young_modulus: float = 5e3
     poisson_ratio: float = 0.25
     friction: float = 0.8
-    damping: float = 3000.0
+    damping: float = 6000.0
     yield_pressure: float = 50.0
     yield_stress: float = 25.0
     tensile_yield_ratio: float = 0.0
@@ -96,13 +96,23 @@ class SandMPMCfg:
 
     # --- Particle spawn ---
     density: float = 1100.0  # [kg/m³]
-    particles_per_cell: int = 2  # reduce for faster settling
+    particles_per_cell: int = 3
     emit_lo: tuple = (-0.15, -0.15, 0.02)  # z_lo=0.02 keeps particles above the floor
     emit_hi: tuple = (0.15, 0.15, 0.20)  # z_hi=0.20 keeps robot links above spawn volume
     initial_jitter: float = 0.5
 
     # --- Startup settling ---
     settle_steps: int = 120  # MPM steps at episode init
+
+    # --- Velocity caps ---
+    # CFL condition: v_max * dt / voxel_size < 1.
+    # With voxel_size=0.01 and dt=1/60: v_max < 0.6 m/s for stability.
+    # particle_max_velocity clamps particle speed after each MPM step.
+    # max_proxy_velocity clamps how fast the scoop collider appears to move
+    # to the MPM finite_difference kernel — this is the dominant injection path
+    # when a random RL agent drives joints aggressively (scoop tip at 5–15 m/s).
+    particle_max_velocity: float = 0.5  # [m/s] — keep below CFL limit (0.6 m/s)
+    max_proxy_velocity: float = 0.5  # [m/s] — cap collider velocity seen by MPM
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +136,37 @@ def _update_proxy_body_q(
         body_pos_w[env_id, robot_body_idx],
         body_quat_w[env_id, robot_body_idx],
     )
+
+
+@wp.kernel
+def _update_proxy_body_q_bounded(
+    body_pos_w: wp.array2d(dtype=wp.vec3f),
+    body_quat_w: wp.array2d(dtype=wp.quatf),
+    robot_link_indices: wp.array(dtype=wp.int32),
+    num_proxy_per_env: wp.int32,
+    max_disp: wp.float32,
+    body_q: wp.array(dtype=wp.transformf),
+):
+    """Copy robot link transforms into proxy body_q, clamping translational displacement.
+
+    Limits the velocity seen by the MPM finite_difference kernel to max_disp/dt.
+    Without this a random RL agent can drive the scoop at 5–15 m/s, which the MPM
+    imposes as a grid boundary condition → CFL violation → particles disappear.
+    """
+    env_id, link_id = wp.tid()
+    robot_body_idx = robot_link_indices[link_id]
+    proxy_idx = env_id * num_proxy_per_env + link_id
+
+    new_pos = body_pos_w[env_id, robot_body_idx]
+    new_quat = body_quat_w[env_id, robot_body_idx]
+    old_pos = wp.transform_get_translation(body_q[proxy_idx])
+
+    delta = new_pos - old_pos
+    dist = wp.length(delta)
+    if dist > max_disp and dist > wp.float32(1e-6):
+        new_pos = old_pos + delta * (max_disp / dist)
+
+    body_q[proxy_idx] = wp.transform(new_pos, new_quat)
 
 
 @wp.kernel
@@ -230,6 +271,7 @@ class SandMPMHelper:
         robot_link_indices: list[int],
         cfg: SandMPMCfg,
         device: str,
+        mpm_dt: float = 1.0 / 60.0,
     ) -> None:
         """Build the Newton sand model. Call after clone_environments() so env_origins are set.
 
@@ -239,10 +281,15 @@ class SandMPMHelper:
             robot_link_indices: Indices into robot.body_names for the 6 proxy links.
             cfg: Sand simulation configuration.
             device: Warp/CUDA device string (e.g. "cuda:0").
+            mpm_dt: Duration of one MPM step [s] (= sim.dt × decimation). Used to convert
+                cfg.max_proxy_velocity into a per-step displacement cap.
         """
         self._num_envs = num_envs
         self._device = device
         self._cfg = cfg
+        # Max translational displacement per MPM step for the bounded proxy update.
+        # Keeps the collider velocity seen by finite_difference below the CFL limit.
+        self._max_proxy_disp = float(cfg.max_proxy_velocity * mpm_dt)
         origins_np = env_origins.cpu().numpy()  # (num_envs, 3)
 
         builder = newton.ModelBuilder()
@@ -300,7 +347,7 @@ class SandMPMHelper:
                     )
 
             # ---- Static box container --------------------------------------
-            box_cfg = newton.ModelBuilder.ShapeConfig(mu=0.6, gap=cfg.voxel_size)
+            box_cfg = newton.ModelBuilder.ShapeConfig(mu=0.6, gap=0.01)
             for _, (hx, hy, hz), centre_local in _BOX_PIECES:
                 cx, cy, cz = (
                     centre_local[0] + offset[0],
@@ -347,6 +394,7 @@ class SandMPMHelper:
         # ---- Finalize model ------------------------------------------------
         self._model = builder.finalize(device=device)
         self._model.set_gravity([0.0, 0.0, -10.0])
+        self._model.particle_max_velocity = cfg.particle_max_velocity
 
         # Populate SolverImplicitMPM.Config from cfg fields
         opts = SolverImplicitMPM.Config()
@@ -397,7 +445,7 @@ class SandMPMHelper:
             body_quat_w: Warp view of robot.data.body_quat_w, shape (num_envs, num_bodies).
             n_steps: Number of MPM steps (~2 s at 60 Hz).
         """
-        self.update_proxy_bodies(body_pos_w, body_quat_w)
+        self.update_proxy_bodies(body_pos_w, body_quat_w, bounded=False)
         # Re-initialize body_q_prev to the hover pose so finite_difference velocity
         # starts at zero on the first MPM step. Without this, body_q_prev would be
         # the origin (set when setup_collider() was called in build()), and the first
@@ -418,20 +466,43 @@ class SandMPMHelper:
         self,
         body_pos_w: wp.array,
         body_quat_w: wp.array,
+        bounded: bool = True,
     ) -> None:
-        """Overwrite proxy body transforms with current robot link poses."""
-        wp.launch(
-            _update_proxy_body_q,
-            dim=(self._num_envs, _NUM_PROXY_PER_ENV),
-            inputs=[
-                body_pos_w,
-                body_quat_w,
-                self._robot_link_indices,
-                _NUM_PROXY_PER_ENV,
-                self._state.body_q,
-            ],
-            device=self._device,
-        )
+        """Overwrite proxy body transforms with current robot link poses.
+
+        Args:
+            bounded: If True, clamp translational displacement to cfg.max_proxy_velocity × dt
+                so the finite_difference collider velocity stays within the MPM CFL limit.
+                Pass False for initial placement (settle, reset) where a large jump is expected
+                and body_q_prev will be re-initialised by reinit_collider() immediately after.
+        """
+        if bounded:
+            wp.launch(
+                _update_proxy_body_q_bounded,
+                dim=(self._num_envs, _NUM_PROXY_PER_ENV),
+                inputs=[
+                    body_pos_w,
+                    body_quat_w,
+                    self._robot_link_indices,
+                    _NUM_PROXY_PER_ENV,
+                    self._max_proxy_disp,
+                    self._state.body_q,
+                ],
+                device=self._device,
+            )
+        else:
+            wp.launch(
+                _update_proxy_body_q,
+                dim=(self._num_envs, _NUM_PROXY_PER_ENV),
+                inputs=[
+                    body_pos_w,
+                    body_quat_w,
+                    self._robot_link_indices,
+                    _NUM_PROXY_PER_ENV,
+                    self._state.body_q,
+                ],
+                device=self._device,
+            )
 
     def step(self, dt: float) -> None:
         """Advance the MPM simulation by one control step."""
@@ -485,7 +556,10 @@ class SandMPMHelper:
         # setup_collider() cannot be called here — this runs inside a CUDA graph and
         # setup_collider() does a GPU→CPU copy (shape_flags.numpy()) which is illegal
         # during graph capture. The caller handles reinit via reinit_collider().
-        self.update_proxy_bodies(body_pos_w, body_quat_w)
+        # Use bounded=False: the robot teleports to its reset pose, which is a large
+        # discontinuous jump. reinit_collider() (called by the env one step later) will
+        # zero body_q_prev, so the next MPM step sees velocity ≈ 0 regardless.
+        self.update_proxy_bodies(body_pos_w, body_quat_w, bounded=False)
 
     def reinit_collider(self) -> None:
         """Reset the solver's internal body_q_prev to the current proxy body positions.

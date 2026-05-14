@@ -189,6 +189,31 @@ def _get_dones(
 
 
 @wp.kernel
+def _reset_actions_for_mask(
+    env_mask: wp.array(dtype=wp.bool),
+    num_dofs: wp.int32,
+    actions: wp.array2d(dtype=wp.float32),
+):
+    """Zero out the smoothed-action buffer for envs in the reset mask."""
+    env_id = wp.tid()
+    if env_mask[env_id]:
+        for i in range(num_dofs):
+            actions[env_id, i] = wp.float32(0.0)
+
+
+@wp.kernel
+def _smooth_actions(
+    raw: wp.array2d(dtype=wp.float32),
+    prev: wp.array2d(dtype=wp.float32),
+    alpha: wp.float32,
+    out: wp.array2d(dtype=wp.float32),
+):
+    """Exponential moving average: out = alpha * raw + (1 - alpha) * prev."""
+    env_id, dof_id = wp.tid()
+    out[env_id, dof_id] = alpha * raw[env_id, dof_id] + (wp.float32(1.0) - alpha) * prev[env_id, dof_id]
+
+
+@wp.kernel
 def _reset_joints(
     default_joint_pos: wp.array2d(dtype=wp.float32),
     default_joint_vel: wp.array2d(dtype=wp.float32),
@@ -297,6 +322,11 @@ class ScoopWarpEnvCfg(DirectRLEnvCfg):
     # reset
     reset_dof_pos_noise: float = 0.05  # radians noise around default pose
 
+    # action smoothing — exponential moving average applied in _pre_physics_step.
+    # Limits how fast joints can move between steps: scoop velocity ≈ raw_velocity × alpha.
+    # alpha=1.0 = no smoothing; alpha=0.2 = ~5-step lag, reduces 15 m/s → ~3 m/s.
+    action_smoothing: float = 0.2
+
 
 # ---------------------------------------------------------------------------
 # Environment implementation
@@ -327,6 +357,9 @@ class ScoopWarpEnv(DirectRLEnvWarp):
 
         # Sand MPM — build separate Newton model and settle particles
         robot_link_indices = [self.robot.body_names.index(name) for name in UR5_PROXY_LINK_NAMES]
+        # MPM control-step dt = physics dt × decimation
+        self._mpm_dt: float = self.cfg.sim.dt * self.cfg.decimation
+
         self._sand = SandMPMHelper()
         self._sand.build(
             num_envs=self.num_envs,
@@ -334,15 +367,13 @@ class ScoopWarpEnv(DirectRLEnvWarp):
             robot_link_indices=robot_link_indices,
             cfg=self.cfg.sand,
             device=self.device,
+            mpm_dt=self._mpm_dt,
         )
         self._sand.settle(
             body_pos_w=self._body_pos_w,
             body_quat_w=self._body_quat_w,
             n_steps=self.cfg.sand.settle_steps,
         )
-
-        # MPM control-step dt = physics dt × decimation
-        self._mpm_dt: float = self.cfg.sim.dt * self.cfg.decimation
 
         # Pre-allocated CUDA arrays for log_points (avoids per-frame GPU allocation).
         # log_points requires wp.array for radii/colors — Python float/tuple cause a kernel error.
@@ -369,6 +400,10 @@ class ScoopWarpEnv(DirectRLEnvWarp):
         # Torch-aliased buffers expected by DirectRLEnvWarp base class
         self.torch_obs_buf = wp.to_torch(self._observations)
         self.torch_reward_buf = wp.to_torch(self._rewards)
+
+        # Smoothed action buffer — holds the EMA-filtered actions from the previous step.
+        # Initialised to zeros (hover pose actions are near-zero after scaling).
+        self._actions_prev = wp.zeros((self.num_envs, self.cfg.action_space), dtype=wp.float32, device=self.device)
 
         # Flag: reinit MPM collider body_q_prev the step AFTER a reset.
         # setup_collider() cannot run inside the CUDA graph (does GPU→CPU copies),
@@ -423,7 +458,17 @@ class ScoopWarpEnv(DirectRLEnvWarp):
     # ------------------------------------------------------------------
 
     def _pre_physics_step(self, actions: wp.array) -> None:
-        wp.copy(self._actions, actions)
+        # Exponential moving average smoothing: limits scoop velocity seen by the MPM.
+        # Without smoothing a random agent can drive the scoop at ~15 m/s; the MPM
+        # imposes that as a boundary condition on contact particles → they fly.
+        # alpha=0.2 reduces effective scoop velocity to ~20% per step.
+        wp.launch(
+            _smooth_actions,
+            dim=(self.num_envs, self.cfg.action_space),
+            inputs=[actions, self._actions_prev, self.cfg.action_smoothing, self._actions],
+            device=self.device,
+        )
+        wp.copy(self._actions_prev, self._actions)
 
     def _apply_action(self) -> None:
         wp.launch(
@@ -564,6 +609,15 @@ class ScoopWarpEnv(DirectRLEnvWarp):
         )
 
         self._update_ee_pos()
+
+        # Clear smoothed-action history for reset envs so stale end-of-episode
+        # actions don't bleed into the new episode via the EMA filter.
+        wp.launch(
+            _reset_actions_for_mask,
+            dim=self.num_envs,
+            inputs=[mask, self.cfg.action_space, self._actions_prev],
+            device=self.device,
+        )
 
         # Reset sand particles to settled snapshot for the masked envs
         self._sand.reset(
