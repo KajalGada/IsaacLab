@@ -74,7 +74,7 @@ class SandMPMCfg:
     """Configuration for the kinetic-sand MPM simulation."""
 
     # --- SolverImplicitMPM.Config fields ---
-    voxel_size: float = 0.01  # [m]
+    voxel_size: float = 0.02  # [m] — coarser grid keeps particle count tractable for many envs
     grid_type: str = "sparse"
     solver: str = "gauss-seidel"
     transfer_scheme: str = "apic"
@@ -96,7 +96,7 @@ class SandMPMCfg:
 
     # --- Particle spawn ---
     density: float = 1100.0  # [kg/m³]
-    particles_per_cell: int = 3
+    particles_per_cell: int = 2  # controls spawn grid resolution; 2 gives ~18k particles/env at voxel_size=0.02
     emit_lo: tuple = (-0.15, -0.15, 0.02)  # z_lo=0.02 keeps particles above the floor
     emit_hi: tuple = (0.15, 0.15, 0.20)  # z_hi=0.20 keeps robot links above spawn volume
     initial_jitter: float = 0.5
@@ -106,13 +106,13 @@ class SandMPMCfg:
 
     # --- Velocity caps ---
     # CFL condition: v_max * dt / voxel_size < 1.
-    # With voxel_size=0.01 and dt=1/60: v_max < 0.6 m/s for stability.
+    # With voxel_size=0.02 and dt=1/60: v_max < 1.2 m/s for stability.
     # particle_max_velocity clamps particle speed after each MPM step.
     # max_proxy_velocity clamps how fast the scoop collider appears to move
     # to the MPM finite_difference kernel — this is the dominant injection path
     # when a random RL agent drives joints aggressively (scoop tip at 5–15 m/s).
-    particle_max_velocity: float = 0.5  # [m/s] — keep below CFL limit (0.6 m/s)
-    max_proxy_velocity: float = 0.5  # [m/s] — cap collider velocity seen by MPM
+    particle_max_velocity: float = 1.0  # [m/s] — keep below CFL limit (1.2 m/s)
+    max_proxy_velocity: float = 1.0  # [m/s] — cap collider velocity seen by MPM
 
 
 # ---------------------------------------------------------------------------
@@ -191,25 +191,34 @@ def _compute_sand_obs(
     particle_q: wp.array(dtype=wp.vec3f),
     snapshot_q: wp.array(dtype=wp.vec3f),
     env_origins: wp.array(dtype=wp.vec3f),
+    ee_pos_local: wp.array(dtype=wp.vec3f),
     starts: wp.array(dtype=wp.int32),
     counts: wp.array(dtype=wp.int32),
     displaced_threshold: wp.float32,
+    lift_threshold: wp.float32,
     observations: wp.array2d(dtype=wp.float32),
     obs_offset: wp.int32,
+    centroid_out: wp.array(dtype=wp.vec3f),
 ):
-    """Write 5 aggregated sand features into observations[:, obs_offset:obs_offset+5].
+    """Write 8 aggregated sand features into observations[:, obs_offset:obs_offset+8].
 
-    Features: centroid_x, centroid_y, centroid_z (env-local), mean_z, displaced_fraction.
+    Features (env-local):
+        [0:3]  sand centroid xyz
+        [3:6]  scoop → centroid vector (centroid - ee_pos_local)
+        [6]    displaced_fraction  (particles moved > displaced_threshold from settled)
+        [7]    elevated_fraction   (particles lifted > lift_threshold above settled z)
     """
     env_id = wp.tid()
     n = counts[env_id]
     start = starts[env_id]
     origin = env_origins[env_id]
+    ee = ee_pos_local[env_id]
 
     cx = wp.float32(0.0)
     cy = wp.float32(0.0)
     cz = wp.float32(0.0)
     displaced = wp.int32(0)
+    elevated = wp.int32(0)
 
     for i in range(n):
         idx = start + i
@@ -220,40 +229,94 @@ def _compute_sand_obs(
         cz += p[2]
         if wp.length(p - p0) > displaced_threshold:
             displaced += 1
+        if p[2] > p0[2] + lift_threshold:
+            elevated += 1
 
     fn = wp.float32(n)
-    observations[env_id, obs_offset + 0] = cx / fn
-    observations[env_id, obs_offset + 1] = cy / fn
-    observations[env_id, obs_offset + 2] = cz / fn
-    observations[env_id, obs_offset + 3] = cz / fn  # mean_z == centroid_z
-    observations[env_id, obs_offset + 4] = wp.float32(displaced) / fn
+    cent_x = cx / fn
+    cent_y = cy / fn
+    cent_z = cz / fn
+
+    observations[env_id, obs_offset + 0] = cent_x
+    observations[env_id, obs_offset + 1] = cent_y
+    observations[env_id, obs_offset + 2] = cent_z
+    observations[env_id, obs_offset + 3] = cent_x - ee[0]
+    observations[env_id, obs_offset + 4] = cent_y - ee[1]
+    observations[env_id, obs_offset + 5] = cent_z - ee[2]
+    observations[env_id, obs_offset + 6] = wp.float32(displaced) / fn
+    observations[env_id, obs_offset + 7] = wp.float32(elevated) / fn
+
+    centroid_out[env_id] = wp.vec3f(cent_x, cent_y, cent_z)
 
 
 @wp.kernel
-def _add_sand_capture_reward(
+def _compute_centroids(
     particle_q: wp.array(dtype=wp.vec3f),
+    env_origins: wp.array(dtype=wp.vec3f),
+    starts: wp.array(dtype=wp.int32),
+    counts: wp.array(dtype=wp.int32),
+    centroid_out: wp.array(dtype=wp.vec3f),
+):
+    """Write env-local sand centroid positions to centroid_out."""
+    env_id = wp.tid()
+    n = counts[env_id]
+    start = starts[env_id]
+    origin = env_origins[env_id]
+    cx = wp.float32(0.0)
+    cy = wp.float32(0.0)
+    cz = wp.float32(0.0)
+    for i in range(n):
+        p = particle_q[start + i] - origin
+        cx += p[0]
+        cy += p[1]
+        cz += p[2]
+    fn = wp.float32(n)
+    centroid_out[env_id] = wp.vec3f(cx / fn, cy / fn, cz / fn)
+
+
+@wp.kernel
+def _add_scoop_rewards(
+    particle_q: wp.array(dtype=wp.vec3f),
+    snapshot_q: wp.array(dtype=wp.vec3f),
     env_origins: wp.array(dtype=wp.vec3f),
     ee_pos_local: wp.array(dtype=wp.vec3f),
     starts: wp.array(dtype=wp.int32),
     counts: wp.array(dtype=wp.int32),
-    radius: wp.float32,
-    scale: wp.float32,
+    lift_threshold: wp.float32,
+    capture_radius_xy: wp.float32,
+    elevation_scale: wp.float32,
+    captured_scale: wp.float32,
     rewards: wp.array(dtype=wp.float32),
 ):
-    """Add sand-capture reward: fraction of particles within `radius` of the EE."""
+    """Add elevation and captured-elevated reward components in-place.
+
+    elevation reward: fraction of particles lifted > lift_threshold above settled z.
+    captured_elevated reward: fraction of elevated particles within capture_radius_xy of the scoop.
+    """
     env_id = wp.tid()
     n = counts[env_id]
     start = starts[env_id]
     origin = env_origins[env_id]
     ee = ee_pos_local[env_id]
 
-    captured = wp.int32(0)
-    for i in range(n):
-        p_local = particle_q[start + i] - origin
-        if wp.length(p_local - ee) <= radius:
-            captured += 1
+    elevated = wp.int32(0)
+    captured_elevated = wp.int32(0)
 
-    rewards[env_id] += scale * wp.float32(captured) / wp.float32(n)
+    for i in range(n):
+        idx = start + i
+        p = particle_q[idx] - origin
+        p0 = snapshot_q[idx] - origin
+        is_elevated = p[2] > p0[2] + lift_threshold
+        if is_elevated:
+            elevated += 1
+            dx = p[0] - ee[0]
+            dy = p[1] - ee[1]
+            if dx * dx + dy * dy < capture_radius_xy * capture_radius_xy:
+                captured_elevated += 1
+
+    fn = wp.float32(n)
+    rewards[env_id] += elevation_scale * wp.float32(elevated) / fn
+    rewards[env_id] += captured_scale * wp.float32(captured_elevated) / fn
 
 
 # ---------------------------------------------------------------------------
@@ -582,10 +645,22 @@ class SandMPMHelper:
     def compute_obs(
         self,
         env_origins: wp.array,
+        ee_pos_local: wp.array,
         observations: wp.array,
-        obs_offset: int = 24,
+        centroid_out: wp.array,
+        lift_threshold: float = 0.03,
+        obs_offset: int = 25,
     ) -> None:
-        """Write 5 sand feature dims into observations starting at obs_offset."""
+        """Write 8 sand feature dims into observations starting at obs_offset.
+
+        Also writes env-local sand centroid to centroid_out.
+
+        Features written (env-local):
+            [0:3]  sand centroid xyz
+            [3:6]  scoop → centroid vector
+            [6]    displaced_fraction
+            [7]    elevated_fraction
+        """
         wp.launch(
             _compute_sand_obs,
             dim=self._num_envs,
@@ -593,35 +668,58 @@ class SandMPMHelper:
                 self._state.particle_q,
                 self._snapshot_q,
                 env_origins,
+                ee_pos_local,
                 self._env_particle_start,
                 self._env_particle_count,
                 0.02,  # displaced_threshold [m]
+                lift_threshold,
                 observations,
                 obs_offset,
+                centroid_out,
             ],
             device=self._device,
         )
 
-    def add_capture_reward(
-        self,
-        env_origins: wp.array,
-        ee_pos_local: wp.array,
-        rewards: wp.array,
-        radius: float,
-        scale: float,
-    ) -> None:
-        """Add sand-capture reward component in-place to rewards."""
+    def compute_centroids(self, env_origins: wp.array, centroid_out: wp.array) -> None:
+        """Write env-local sand centroids to centroid_out (lightweight, no obs write)."""
         wp.launch(
-            _add_sand_capture_reward,
+            _compute_centroids,
             dim=self._num_envs,
             inputs=[
                 self._state.particle_q,
                 env_origins,
+                self._env_particle_start,
+                self._env_particle_count,
+                centroid_out,
+            ],
+            device=self._device,
+        )
+
+    def add_scoop_rewards(
+        self,
+        env_origins: wp.array,
+        ee_pos_local: wp.array,
+        rewards: wp.array,
+        lift_threshold: float,
+        capture_radius_xy: float,
+        elevation_scale: float,
+        captured_scale: float,
+    ) -> None:
+        """Add elevation and captured-elevated reward components in-place to rewards."""
+        wp.launch(
+            _add_scoop_rewards,
+            dim=self._num_envs,
+            inputs=[
+                self._state.particle_q,
+                self._snapshot_q,
+                env_origins,
                 ee_pos_local,
                 self._env_particle_start,
                 self._env_particle_count,
-                radius,
-                scale,
+                lift_threshold,
+                capture_radius_xy,
+                elevation_scale,
+                captured_scale,
                 rewards,
             ],
             device=self._device,

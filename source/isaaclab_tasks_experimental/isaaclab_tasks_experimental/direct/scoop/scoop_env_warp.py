@@ -129,7 +129,8 @@ def _compute_observations(
     joint_limits: wp.array2d(dtype=wp.vec2f),
     actions: wp.array2d(dtype=wp.float32),
     ee_pos_local: wp.array(dtype=wp.vec3f),
-    target_pos: wp.vec3f,
+    body_quat_w: wp.array2d(dtype=wp.quatf),
+    scoop_body_idx: wp.int32,
     dof_vel_scale: wp.float32,
     num_dofs: wp.int32,
     observations: wp.array2d(dtype=wp.float32),
@@ -151,17 +152,19 @@ def _compute_observations(
     observations[env_id, base + 0] = ee_pos_local[env_id][0]
     observations[env_id, base + 1] = ee_pos_local[env_id][1]
     observations[env_id, base + 2] = ee_pos_local[env_id][2]
-    # [21:24] vector EE → target
-    observations[env_id, base + 3] = target_pos[0] - ee_pos_local[env_id][0]
-    observations[env_id, base + 4] = target_pos[1] - ee_pos_local[env_id][1]
-    observations[env_id, base + 5] = target_pos[2] - ee_pos_local[env_id][2]
+    # [21:25] scoop quaternion components (4 dims — consistent ordering for the policy network)
+    q = body_quat_w[env_id, scoop_body_idx]
+    observations[env_id, base + 3] = q[0]
+    observations[env_id, base + 4] = q[1]
+    observations[env_id, base + 5] = q[2]
+    observations[env_id, base + 6] = q[3]
 
 
 @wp.kernel
 def _compute_rewards(
     ee_pos_local: wp.array(dtype=wp.vec3f),
+    sand_centroid: wp.array(dtype=wp.vec3f),
     actions: wp.array2d(dtype=wp.float32),
-    target_pos: wp.vec3f,
     num_dofs: wp.int32,
     dist_scale: wp.float32,
     action_penalty_scale: wp.float32,
@@ -169,7 +172,8 @@ def _compute_rewards(
     rewards: wp.array(dtype=wp.float32),
 ):
     env_id = wp.tid()
-    dist = wp.length(ee_pos_local[env_id] - target_pos)
+    # Approach: reward getting the scoop close to the sand centroid
+    dist = wp.length(ee_pos_local[env_id] - sand_centroid[env_id])
     action_penalty = wp.float32(0.0)
     for i in range(num_dofs):
         action_penalty += actions[env_id, i] * actions[env_id, i]
@@ -244,9 +248,9 @@ class ScoopWarpEnvCfg(DirectRLEnvCfg):
     episode_length_s: float = 10.0
     decimation: int = 2
     action_space: int = 6
-    # 6 scaled joint pos + 6 joint vel + 6 prev actions + 3 EE pos + 3 vec-to-target
-    # + 3 sand centroid + 1 sand mean_z + 1 sand displaced_fraction
-    observation_space: int = 29
+    # 6 joint pos + 6 joint vel + 6 prev actions + 3 EE pos + 4 scoop quat
+    # + 3 sand centroid + 3 scoop→centroid + 1 displaced_frac + 1 elevated_frac = 33
+    observation_space: int = 33
     state_space: int = 0
 
     # Newton MuJoCo-Warp solver
@@ -256,6 +260,7 @@ class ScoopWarpEnvCfg(DirectRLEnvCfg):
         cone="pyramidal",
         integrator="implicitfast",
         impratio=1,
+        save_to_mjcf="/tmp/scoop_newton_debug.xml",
     )
     newton_cfg = NewtonCfg(
         solver_cfg=solver_cfg,
@@ -306,15 +311,15 @@ class ScoopWarpEnvCfg(DirectRLEnvCfg):
 
     # task
     scoop_body_name: str = "scoop_link"
-    # Target in env-local coordinates: centre of sand box at 5 cm depth
-    target_pos: tuple = (0.0, 0.0, 0.05)
 
     # reward scales
-    dist_reward_scale: float = -1.0
+    dist_reward_scale: float = -0.5  # approach: penalises distance scoop → sand centroid
     action_penalty_scale: float = -0.001
-    alive_reward: float = 0.1
-    sand_capture_scale: float = 2.0
-    sand_capture_radius: float = 0.10  # [m] radius around wrist_3_link
+    alive_reward: float = 0.05
+    elevation_reward_scale: float = 4.0   # fraction of particles lifted > lift_threshold
+    captured_elevated_scale: float = 3.0  # fraction of elevated particles near scoop
+    lift_threshold: float = 0.03          # [m] above settled z to count as elevated
+    capture_radius_xy: float = 0.08       # [m] horizontal radius for captured-elevated reward
 
     # observation scaling
     dof_vel_scale: float = 0.1
@@ -394,16 +399,18 @@ class ScoopWarpEnv(DirectRLEnvWarp):
         seed = self.cfg.seed if self.cfg.seed is not None else 0
         wp.launch(_initialize_rng, dim=self.num_envs, inputs=[seed, self._rng_state], device=self.device)
 
-        # Target position constant (same for every env — env-local frame)
-        self._target_pos_wp = wp.vec3f(*self.cfg.target_pos)
-
         # Torch-aliased buffers expected by DirectRLEnvWarp base class
         self.torch_obs_buf = wp.to_torch(self._observations)
         self.torch_reward_buf = wp.to_torch(self._rewards)
+        self.torch_reset_terminated = wp.to_torch(self.reset_terminated)
+        self.torch_reset_time_outs = wp.to_torch(self.reset_time_outs)
 
         # Smoothed action buffer — holds the EMA-filtered actions from the previous step.
         # Initialised to zeros (hover pose actions are near-zero after scaling).
         self._actions_prev = wp.zeros((self.num_envs, self.cfg.action_space), dtype=wp.float32, device=self.device)
+
+        # Sand centroid buffer — filled by compute_centroids (rewards) and compute_obs (obs).
+        self._sand_centroid = wp.zeros(self.num_envs, dtype=wp.vec3f, device=self.device)
 
         # Flag: reinit MPM collider body_q_prev the step AFTER a reset.
         # setup_collider() cannot run inside the CUDA graph (does GPU→CPU copies),
@@ -490,29 +497,38 @@ class ScoopWarpEnv(DirectRLEnvWarp):
                 self._joint_limits,
                 self._actions,
                 self._ee_pos_local,
-                self._target_pos_wp,
+                self._body_quat_w,
+                self._scoop_body_idx,
                 self.cfg.dof_vel_scale,
                 self.robot.num_joints,
                 self._observations,
             ],
             device=self.device,
         )
-        # dims [24:29]: sand centroid (3), mean_z (1), displaced_fraction (1)
+        # dims [25:33]: sand centroid (3), scoop→centroid (3), displaced_frac (1), elevated_frac (1)
         self._sand.compute_obs(
             env_origins=self._env_origins,
+            ee_pos_local=self._ee_pos_local,
             observations=self._observations,
-            obs_offset=24,
+            centroid_out=self._sand_centroid,
+            lift_threshold=self.cfg.lift_threshold,
+            obs_offset=25,
         )
         return {"policy": self.torch_obs_buf}
 
     def _get_rewards(self) -> None:
+        # Compute sand centroid for approach reward (obs not yet computed this step)
+        self._sand.compute_centroids(
+            env_origins=self._env_origins,
+            centroid_out=self._sand_centroid,
+        )
         wp.launch(
             _compute_rewards,
             dim=self.num_envs,
             inputs=[
                 self._ee_pos_local,
+                self._sand_centroid,
                 self._actions,
-                self._target_pos_wp,
                 self.robot.num_joints,
                 self.cfg.dist_reward_scale,
                 self.cfg.action_penalty_scale,
@@ -521,13 +537,15 @@ class ScoopWarpEnv(DirectRLEnvWarp):
             ],
             device=self.device,
         )
-        # Add sand-capture reward on top of base reward
-        self._sand.add_capture_reward(
+        # Add elevation and captured-elevated rewards
+        self._sand.add_scoop_rewards(
             env_origins=self._env_origins,
             ee_pos_local=self._ee_pos_local,
             rewards=self._rewards,
-            radius=self.cfg.sand_capture_radius,
-            scale=self.cfg.sand_capture_scale,
+            lift_threshold=self.cfg.lift_threshold,
+            capture_radius_xy=self.cfg.capture_radius_xy,
+            elevation_scale=self.cfg.elevation_reward_scale,
+            captured_scale=self.cfg.captured_elevated_scale,
         )
 
     def _post_step_visualize(self) -> None:
