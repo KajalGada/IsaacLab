@@ -392,7 +392,10 @@ class NewtonVisualizer(BaseVisualizer):
                 self._viewer.begin_frame(self._sim_time)
                 if self._state is not None:
                     body_q = getattr(self._state, "body_q", None)
-                    if hasattr(body_q, "shape") and body_q.shape[0] == 0:
+                    particle_q = getattr(self._state, "particle_q", None)
+                    has_bodies = hasattr(body_q, "shape") and body_q.shape[0] > 0
+                    has_particles = hasattr(particle_q, "shape") and particle_q.shape[0] > 0
+                    if not has_bodies and not has_particles:
                         self._viewer.end_frame()
                         return
                     self._viewer.log_state(self._state)

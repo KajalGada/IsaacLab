@@ -131,6 +131,7 @@ class NewtonManager(PhysicsManager):
     # Collision and contacts
     _contacts: Contacts | None = None
     _needs_collision_pipeline: bool = False
+    _needs_project_outside: bool = False
     _collision_pipeline = None
     _collision_cfg: NewtonCollisionPipelineCfg | None = None
     _newton_contact_sensors: dict = {}  # Maps sensor_key to NewtonContactSensor
@@ -467,6 +468,7 @@ class NewtonManager(PhysicsManager):
         cls._control = None
         cls._contacts = None
         cls._needs_collision_pipeline = False
+        cls._needs_project_outside = False
         cls._collision_pipeline = None
         cls._collision_cfg = None
         cls._newton_contact_sensors = {}
@@ -963,6 +965,28 @@ class NewtonManager(PhysicsManager):
             elif cls._solver_type == "kamino":
                 cls._use_single_state = False
                 cls._solver = SolverKamino(cls._model, solver_cfg.to_solver_config())
+            elif cls._solver_type == "implicit_mpm":
+                from dataclasses import fields as _dc_fields
+
+                from newton.solvers import SolverImplicitMPM
+
+                cfg_fields = {f.name for f in _dc_fields(SolverImplicitMPM.Config)}
+                mpm_kwargs = {k: v for k, v in cfg_dict.items() if k in cfg_fields}
+                mpm_config = SolverImplicitMPM.Config(**mpm_kwargs)
+                cls._solver = SolverImplicitMPM(
+                    cls._model, mpm_config, temporary_store=None, verbose=None, enable_timers=False
+                )
+                cls._use_single_state = True
+                cls._needs_collision_pipeline = False
+                cls._needs_project_outside = True
+                # Register all static shapes (body=-1) as MPM colliders using
+                # current body transforms from the freshly finalized state.
+                voxel_size = float(getattr(solver_cfg, "voxel_size", 0.02))
+                cls._solver.setup_collider(
+                    collider_body_ids=[-1],
+                    collider_projection_threshold=[0.01 * voxel_size],
+                    body_q=cls._state_0.body_q,
+                )
             else:
                 raise ValueError(f"Invalid solver type: {cls._solver_type}")
 
@@ -984,6 +1008,8 @@ class NewtonManager(PhysicsManager):
                     )
             elif isinstance(cls._solver, SolverKamino):
                 cls._needs_collision_pipeline = not solver_cfg.use_collision_detector
+            elif cls._solver_type == "implicit_mpm":
+                cls._needs_collision_pipeline = False
             else:
                 cls._needs_collision_pipeline = True
 
@@ -1188,6 +1214,10 @@ class NewtonManager(PhysicsManager):
                 else:
                     cls._state_0, cls._state_1 = cls._state_1, cls._state_0
                 cls._state_0.clear_forces()
+
+        if cls._needs_project_outside:
+            frame_dt = cls._solver_dt * cls._num_substeps
+            cls._solver.project_outside(cls._state_0, cls._state_0, frame_dt)
 
         # Update frame transform sensors
         if cls._newton_frame_transform_sensors:
