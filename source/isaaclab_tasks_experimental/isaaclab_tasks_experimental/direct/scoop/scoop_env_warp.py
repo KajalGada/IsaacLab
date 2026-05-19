@@ -333,6 +333,13 @@ class ScoopWarpEnvCfg(DirectRLEnvCfg):
     action_smoothing: float = 0.2
 
 
+@configclass
+class ScoopWarpEnvCfgV1(ScoopWarpEnvCfg):
+    """v1: sandbox and particles shifted to the front of the robot (+x=1.0, +y=0.1)."""
+
+    sand: SandMPMCfg = SandMPMCfg(box_offset=(1.0, 0.1, 0.0))
+
+
 # ---------------------------------------------------------------------------
 # Environment implementation
 # ---------------------------------------------------------------------------
@@ -448,6 +455,7 @@ class ScoopWarpEnv(DirectRLEnvWarp):
             static_friction=0.6,
             dynamic_friction=0.4,
         )
+        off = self.cfg.sand.box_offset
         for name, size, centre in _BOX_PIECES:
             piece_cfg = sim_utils.CuboidCfg(
                 size=size,
@@ -457,7 +465,7 @@ class ScoopWarpEnv(DirectRLEnvWarp):
             piece_cfg.func(
                 f"/World/envs/env_0/SandBox/{name}",
                 piece_cfg,
-                translation=centre,
+                translation=(centre[0] + off[0], centre[1] + off[1], centre[2] + off[2]),
             )
 
     # ------------------------------------------------------------------

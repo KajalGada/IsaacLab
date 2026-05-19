@@ -101,6 +101,9 @@ class SandMPMCfg:
     emit_hi: tuple = (0.15, 0.15, 0.20)  # z_hi=0.20 keeps robot links above spawn volume
     initial_jitter: float = 0.5
 
+    # --- Box and particle offset (env-local, applied on top of env origin) ---
+    box_offset: tuple = (0.0, 0.0, 0.0)  # [m] shifts sandbox and particle spawn region
+
     # --- Startup settling ---
     settle_steps: int = 120  # MPM steps at episode init
 
@@ -400,22 +403,26 @@ class SandMPMHelper:
                     builder.add_shape_sphere(body=body_idx, radius=0.038)
                 elif link_id == 5:  # wrist_3_link
                     builder.add_shape_sphere(body=body_idx, radius=0.032)
-                else:  # scoop_link — flat box (15 cm × 12 cm × 3 cm) offset 5 cm along Z
+                else:  # scoop_link — box matching the USD collision (ur5_scoop.stl bounds, mm→m):
+                    # STL spans X:±3.75cm, Y:0→24.9cm, Z:±3.75cm → half-extents (0.0375, 0.1245, 0.0375),
+                    # centre at (0, 0.1245, 0) in scoop_link frame.
+                    # The fixed joint (rpy=π/2,0,π) maps scoop_link Y → wrist_3 Z (tool approach axis).
                     builder.add_shape_box(
                         body=body_idx,
-                        hx=0.075,
-                        hy=0.060,
-                        hz=0.015,
-                        xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()),
+                        hx=0.0375,
+                        hy=0.1245,
+                        hz=0.0375,
+                        xform=wp.transform(wp.vec3(0.0, 0.1245, 0.0), wp.quat_identity()),
                     )
 
             # ---- Static box container --------------------------------------
+            box_off = cfg.box_offset
             box_cfg = newton.ModelBuilder.ShapeConfig(mu=0.6, gap=0.01)
             for _, (hx, hy, hz), centre_local in _BOX_PIECES:
                 cx, cy, cz = (
-                    centre_local[0] + offset[0],
-                    centre_local[1] + offset[1],
-                    centre_local[2] + offset[2],
+                    centre_local[0] + offset[0] + box_off[0],
+                    centre_local[1] + offset[1] + box_off[1],
+                    centre_local[2] + offset[2] + box_off[2],
                 )
                 builder.add_shape_box(
                     body=-1,
@@ -427,8 +434,9 @@ class SandMPMHelper:
                 )
 
             # ---- Particle grid ---------------------------------------------
-            emit_lo = np.array(cfg.emit_lo, dtype=np.float32) + offset
-            emit_hi = np.array(cfg.emit_hi, dtype=np.float32) + offset
+            box_off_np = np.array(cfg.box_offset, dtype=np.float32)
+            emit_lo = np.array(cfg.emit_lo, dtype=np.float32) + offset + box_off_np
+            emit_hi = np.array(cfg.emit_hi, dtype=np.float32) + offset + box_off_np
             particle_res = np.ceil(cfg.particles_per_cell * (emit_hi - emit_lo) / cfg.voxel_size).astype(int)
             cell_size = (emit_hi - emit_lo) / particle_res
             radius_p = float(np.max(cell_size) * 0.5)

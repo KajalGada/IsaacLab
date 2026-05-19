@@ -407,9 +407,27 @@ def build(usd_path: str = _USD_PATH) -> None:
     UsdGeom.Imageable(col.GetPrim()).MakeInvisible()
     _attach_visual("wrist_3_link")
 
-    # scoop_link — flat box approximating the scoop paddle (15 cm × 12 cm × 3 cm)
-    _add_link(stage, f"{ROOT}/scoop_link", mass=0.5, diag_inertia=(0.001, 0.001, 0.0005), cog=(0.0, 0.0, 0.05))
-    col = _add_cube(stage, f"{ROOT}/scoop_link", "col", size=(0.15, 0.12, 0.03), trans=(0.0, 0.0, 0.05))
+    # scoop_link — box covering the full scoop geometry measured from ur5_scoop.stl (mm→m, scale=0.001):
+    #   X: ±3.75 cm (symmetric), Y: 0 → 24.9 cm (blade extends along scoop_link +Y),
+    #   Z: ±3.75 cm (symmetric).  Centre: (0, 0.1245, 0) in scoop_link frame.
+    # The fixed joint local_rpy0=(π/2, 0, π) maps scoop_link Y → wrist_3 Z, so the
+    # 24.9 cm blade length aligns with the tool approach axis.
+    _SCOOP_CX, _SCOOP_CY, _SCOOP_CZ = 0.0, 0.1245, 0.0
+    _SCOOP_SX, _SCOOP_SY, _SCOOP_SZ = 0.075, 0.249, 0.075
+    _add_link(
+        stage,
+        f"{ROOT}/scoop_link",
+        mass=0.5,
+        diag_inertia=(0.003, 0.001, 0.003),
+        cog=(_SCOOP_CX, _SCOOP_CY, _SCOOP_CZ),
+    )
+    col = _add_cube(
+        stage,
+        f"{ROOT}/scoop_link",
+        "col",
+        size=(_SCOOP_SX, _SCOOP_SY, _SCOOP_SZ),
+        trans=(_SCOOP_CX, _SCOOP_CY, _SCOOP_CZ),
+    )
     UsdGeom.Imageable(col.GetPrim()).MakeInvisible()
     _attach_visual("scoop_link")
 
