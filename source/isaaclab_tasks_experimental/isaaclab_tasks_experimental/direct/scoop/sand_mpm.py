@@ -37,14 +37,16 @@ _BOX_W = 0.35
 _BOX_D = 0.35
 _BOX_WALL_H = 0.05
 _BOX_FLOOR_T = 0.02
+_BOX_X = 1.0   # box centre x
+_BOX_Y = 0.1   # box centre y  (ref -0.2 + scene offset -0.1 + 0.4)
 
 # (name, half_extents_xyz, centre_xyz_env_local)
 _BOX_PIECES: list[tuple[str, tuple, tuple]] = [
-    ("floor", (0.175, 0.175, 0.01), (0.0, 0.0, 0.01)),
-    ("wall_neg_y", (0.175, 0.01, 0.025), (0.0, -_BOX_D / 2, 0.025)),
-    ("wall_pos_y", (0.175, 0.01, 0.025), (0.0, _BOX_D / 2, 0.025)),
-    ("wall_neg_x", (0.01, 0.175, 0.025), (-_BOX_W / 2, 0.0, 0.025)),
-    ("wall_pos_x", (0.01, 0.175, 0.025), (_BOX_W / 2, 0.0, 0.025)),
+    ("floor",     (0.175, 0.175, 0.01),  (_BOX_X,              _BOX_Y,              0.01)),
+    ("wall_neg_y",(0.175, 0.01,  0.025), (_BOX_X,              _BOX_Y - _BOX_D / 2, 0.025)),
+    ("wall_pos_y",(0.175, 0.01,  0.025), (_BOX_X,              _BOX_Y + _BOX_D / 2, 0.025)),
+    ("wall_neg_x",(0.01,  0.175, 0.025), (_BOX_X - _BOX_W / 2, _BOX_Y,              0.025)),
+    ("wall_pos_x",(0.01,  0.175, 0.025), (_BOX_X + _BOX_W / 2, _BOX_Y,              0.025)),
 ]
 
 # ---------------------------------------------------------------------------
@@ -97,12 +99,12 @@ class SandMPMCfg:
     # --- Particle spawn ---
     density: float = 1100.0  # [kg/m³]
     particles_per_cell: int = 2  # controls spawn grid resolution; 2 gives ~18k particles/env at voxel_size=0.02
-    emit_lo: tuple = (-0.15, -0.15, 0.02)  # z_lo=0.02 keeps particles above the floor
-    emit_hi: tuple = (0.15, 0.15, 0.20)  # z_hi=0.20 keeps robot links above spawn volume
+    emit_lo: tuple = (0.85, -0.05, 0.02)   # ref emit_lo (-0.15,-0.35,0.02) + scene offset (1.0,0.3,0)
+    emit_hi: tuple = (1.15,  0.25, 0.20)   # ref emit_hi ( 0.15,-0.05,0.20) + scene offset (1.0,0.3,0)
     initial_jitter: float = 0.5
 
-    # --- Box and particle offset (env-local, applied on top of env origin) ---
-    box_offset: tuple = (0.0, 0.0, 0.0)  # [m] shifts sandbox and particle spawn region
+    # --- Fine-tuning offset (env-local, added on top of the baked-in box position) ---
+    box_offset: tuple = (0.0, 0.0, 0.0)  # [m] additional shift; default 0 — box position already at y=-0.2
 
     # --- Startup settling ---
     settle_steps: int = 120  # MPM steps at episode init
@@ -575,8 +577,17 @@ class SandMPMHelper:
                 device=self._device,
             )
 
-    def step(self, dt: float) -> None:
-        """Advance the MPM simulation by one control step."""
+    def step(self, dt: float, project_outside: bool = False) -> None:
+        """Advance the MPM simulation by one control step.
+
+        Args:
+            dt: Timestep [s].
+            project_outside: If True, call ``_project_outside`` before the grid solve to repair
+                particles that tunnelled through the scoop since the last step. Matches the
+                interleaved pattern in ``simulation_newton_sand_v3.py`` lines 246-247.
+        """
+        if project_outside:
+            self._solver._project_outside(self._state, self._state, dt)
         self._solver.step(self._state, self._state, contacts=None, control=None, dt=dt)
 
     def get_env_particle_q(self, env_id: int = 0) -> wp.array:

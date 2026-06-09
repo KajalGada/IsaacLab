@@ -44,6 +44,8 @@ parser.add_argument(
 parser.add_argument("--loop", action="store_true", default=False, help="Loop waypoints continuously.")
 parser.add_argument("--step", type=int, default=1, help="Step size through waypoints (1 = full speed).")
 parser.add_argument("--headless", action="store_true", default=False, help="Run without a viewer.")
+parser.add_argument("--show_collision", action="store_true", default=False,
+                    help="Render collision meshes instead of visual meshes.")
 parser.add_argument("--num_steps", type=int, default=0, help="Stop after N steps (0 = run until done/closed).")
 parser.add_argument("--settle_steps", type=int, default=120, help="MPM settling steps at startup.")
 parser.add_argument(
@@ -98,6 +100,7 @@ def main():
     cfg = ScoopWarpEnvCfgV2()
     cfg.settle_steps = args.settle_steps
     cfg.box_offset = tuple(args.box_offset)
+    cfg.render_wireframe = args.show_collision  # wireframe = visible collision outlines
 
     env = ScoopWarpEnvV2(cfg)
     env.reset()
@@ -127,7 +130,15 @@ def main():
                 pitch=args.camera_pitch,
                 yaw=args.camera_yaw,
             )
+            # With render_wireframe=True the collision shapes are wireframes,
+            # so show both collision (wireframe outlines) and visual (solid mesh)
+            # together for a clear overlay.  Without wireframe, hide visual to
+            # avoid the two solid meshes being identical.
+            viewer.show_collision = args.show_collision
+            viewer.show_visual    = True
+            viewer.show_static    = True   # always show ground + sandbox walls
             print(f"[INFO] Newton ViewerGL initialised. Camera: pos={args.camera_pos} pitch={args.camera_pitch} yaw={args.camera_yaw}")
+            print(f"[INFO] show_collision={args.show_collision}  wireframe={args.show_collision}")
         except Exception as exc:
             print(f"[WARN] Could not create Newton viewer ({exc}). Running headless.")
 

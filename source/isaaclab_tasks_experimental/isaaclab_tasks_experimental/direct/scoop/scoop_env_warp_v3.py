@@ -3,11 +3,22 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""UR5+scoop direct RL environment for sand scooping using Newton MuJoCo-Warp physics.
+"""Isaac-Scoop-Direct-Warp-v3: standalone self-contained environment.
 
-Robot dynamics are handled by IsaacLab's MuJoCo-Warp backend. Sand particles are
-simulated in a separate Newton MPM model coupled one-way (robot body poses → MPM
-colliders each step). See sand_mpm.py for the MPM architecture.
+This module does not import from scoop_env_warp.py. All base environment code
+(constants, Warp kernels, ScoopWarpEnvCfg, ScoopWarpEnv) is inlined here.
+The only intra-package dependency is sand_mpm.py.
+
+Differences from v0/v1
+-----------------------
+* All MPM material parameters match ``simulation_newton_sand_v3.py`` exactly:
+  density=1400, young_modulus=8000, poisson_ratio=0.4, friction=1.4,
+  damping=400, yield_stress=100, tensile_yield_ratio=0.2, hardening=1.0,
+  air_drag=6.0.  Voxel size reduced to 0.01 m (from 0.02 m).
+* Sandbox shifted to box_offset=(0, -0.2, 0), matching the reference scene.
+* ``_project_outside`` is called before every MPM grid solve (``SandMPMHelper.step``
+  with ``project_outside=True``).  This repairs particles that tunnelled through
+  the scoop between control steps, the key physics fix from the reference script.
 """
 
 from __future__ import annotations
@@ -333,13 +344,6 @@ class ScoopWarpEnvCfg(DirectRLEnvCfg):
     # Limits how fast joints can move between steps: scoop velocity ≈ raw_velocity × alpha.
     # alpha=1.0 = no smoothing; alpha=0.2 = ~5-step lag, reduces 15 m/s → ~3 m/s.
     action_smoothing: float = 0.2
-
-
-@configclass
-class ScoopWarpEnvCfgV1(ScoopWarpEnvCfg):
-    """v1: sandbox and particles shifted to the front of the robot (+x=1.0, +y=0.1)."""
-
-    sand: SandMPMCfg = SandMPMCfg(box_offset=(1.0, 0.1, 0.0))
 
 
 # ---------------------------------------------------------------------------
@@ -671,3 +675,73 @@ class ScoopWarpEnv(DirectRLEnvWarp):
             ],
             device=self.device,
         )
+
+
+# ---------------------------------------------------------------------------
+# v3 overrides: reference-script parameters + _project_outside
+# ---------------------------------------------------------------------------
+
+
+@configclass
+class ScoopWarpEnvCfgV3(ScoopWarpEnvCfg):
+    """v3 config: all MPM material values from simulation_newton_sand_v3.py."""
+
+    sand: SandMPMCfg = SandMPMCfg(
+        # Grid — finer voxel matches reference (line 337)
+        voxel_size=0.01,
+        # Particle spawn — particles_per_cell=3 matches reference (line 333).
+        # Box position (y=-0.2) and emit_lo/hi are baked into _BOX_PIECES and
+        # SandMPMCfg defaults; no box_offset override needed.
+        density=1400.0,
+        particles_per_cell=3,
+        # Material — kinetic-sand parameters from reference lines 364-376
+        young_modulus=8000.0,
+        poisson_ratio=0.4,
+        friction=1.4,
+        damping=400.0,
+        yield_pressure=50.0,
+        yield_stress=100.0,
+        tensile_yield_ratio=0.2,
+        hardening=1.0,
+        air_drag=6.0,
+        critical_fraction=0.0,
+    )
+
+
+class ScoopWarpEnvV3(ScoopWarpEnv):
+    """v3: reference-script parameters + _project_outside before each MPM grid solve.
+
+    Inherits all scene setup, Warp kernels, reward shaping, and reset logic from
+    ``ScoopWarpEnv`` (defined in this module).  The only behavioural change is in
+    ``_post_step_visualize``: ``SandMPMHelper.step`` is called with
+    ``project_outside=True``, which runs ``_project_outside`` before the MPM solve
+    to repair tunnelled particles.
+    """
+
+    cfg: ScoopWarpEnvCfgV3
+
+    def _post_step_visualize(self) -> None:
+        # Reinit collider body_q_prev the step after a reset so finite_difference
+        # velocity is zero at the start of each new episode.
+        if self._collider_reinit_pending:
+            self._sand.reinit_collider()
+            self._collider_reinit_pending = False
+
+        if wp.to_torch(self.reset_buf).any():
+            self._collider_reinit_pending = True
+
+        # project_outside=True: repair particles that tunnelled through the scoop
+        # before the grid-level solve.  Matches simulation_newton_sand_v3.py lines 246-247.
+        self._sand.step(dt=self._mpm_dt, project_outside=True)
+
+        # Render env-0 particles via Newton viewer log_points (CUDA array, no CPU copy).
+        particle_q_all = self._sand.get_all_particle_q()
+        for viz in self.sim.visualizers:
+            viewer = getattr(viz, "_viewer", None)
+            if viewer is not None and hasattr(viewer, "log_points"):
+                viewer.log_points(
+                    "/sand_particles",
+                    particle_q_all,
+                    radii=self._particle_radii,
+                    colors=self._particle_colors,
+                )

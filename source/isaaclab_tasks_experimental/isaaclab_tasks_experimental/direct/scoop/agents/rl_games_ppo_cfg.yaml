@@ -57,7 +57,7 @@ params:
     normalize_advantage: True
     gamma: 0.99
     tau: 0.95
-    learning_rate: 3e-4
+    learning_rate: 1.0e-4
     lr_schedule: adaptive
     schedule_type: legacy
     kl_threshold: 0.008
@@ -70,7 +70,7 @@ params:
     truncate_grads: True
     e_clip: 0.2
     horizon_length: 32
-    minibatch_size: 1024
+    minibatch_size: 512
     mini_epochs: 4
     critic_coef: 2
     clip_value: True

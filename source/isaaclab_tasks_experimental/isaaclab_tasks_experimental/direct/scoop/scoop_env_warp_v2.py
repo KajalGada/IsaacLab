@@ -70,7 +70,7 @@ class ScoopWarpEnvCfgV2:
 
     # --- Simulation timing ---
     fps: float = 60.0
-    sim_substeps: int = 4  # robot solver substeps per control step
+    sim_substeps: int = 4   # interleaved robot+MPM substeps per control step
     max_episode_steps: int = 600
 
     # --- Robot ---
@@ -79,32 +79,34 @@ class ScoopWarpEnvCfgV2:
     # --- Sandbox ---
     box_offset: tuple = (0.0, -0.2, 0.0)  # shift sandbox in env-local frame
 
-    # --- Sand MPM material ---
-    voxel_size: float = 0.02
+    # --- Sand MPM material (tuned to match simulation_newton_sand_v3.py) ---
+    voxel_size: float = 0.01  # must be <= scoop_thickness/3 (~3 cm) for mesh SDF to register
     grid_type: str = "sparse"
     solver: str = "gauss-seidel"
     transfer_scheme: str = "apic"
     max_iterations: int = 250
     tolerance: float = 1e-6
-    young_modulus: float = 5e3
-    poisson_ratio: float = 0.25
-    friction: float = 0.8
-    damping: float = 6000.0
+    young_modulus: float = 8000.0
+    poisson_ratio: float = 0.4
+    friction: float = 1.4
+    damping: float = 400.0
     yield_pressure: float = 50.0
-    yield_stress: float = 25.0
-    tensile_yield_ratio: float = 0.0
-    hardening: float = 0.5
-    air_drag: float = 1.0
+    yield_stress: float = 100.0
+    tensile_yield_ratio: float = 0.2
+    hardening: float = 1.0
+    air_drag: float = 6.0
     critical_fraction: float = 0.0
 
     # --- Particle spawn ---
-    density: float = 1100.0
-    particles_per_cell: int = 2
+    density: float = 1400.0
+    particles_per_cell: int = 3
     emit_lo: tuple = (-0.15, -0.15, 0.02)
     emit_hi: tuple = (0.15, 0.15, 0.20)
     initial_jitter: float = 0.5
-    particle_max_velocity: float = 1.0
     settle_steps: int = 120
+
+    # --- Rendering ---
+    render_wireframe: bool = False  # render collision shapes as wireframe instead of solid
 
     # --- Rewards ---
     dist_reward_scale: float = -0.5
@@ -252,10 +254,14 @@ class ScoopWarpEnvV2(gym.Env):
             radius_mean=radius,
         )
 
+        # ---- Wireframe mode (makes collision shapes visible as outlines) ----
+        if cfg.render_wireframe:
+            for i in range(len(builder.shape_is_solid)):
+                builder.shape_is_solid[i] = False
+
         # ---- Finalise ----
         self._model = builder.finalize()
         self._model.set_gravity([0.0, 0.0, -10.0])
-        self._model.particle_max_velocity = cfg.particle_max_velocity
 
         # Set MPM material params
         mpm_fields = [
@@ -331,9 +337,8 @@ class ScoopWarpEnvV2(gym.Env):
     # ------------------------------------------------------------------
 
     def _settle(self) -> None:
-        dt = self._control_dt
         for _ in range(self.cfg.settle_steps):
-            self._mpm_solver.step(self._state0, self._state0, contacts=None, control=None, dt=dt)
+            self._mpm_solver.step(self._state0, self._state0, contacts=None, control=None, dt=self._sim_dt)
         self._snapshot_q = self._state0.particle_q.numpy().copy()
         self._snapshot_qd = self._state0.particle_qd.numpy().copy()
         print(f"[ScoopWarpEnvV2] Sand settled over {self.cfg.settle_steps} steps.")
@@ -387,14 +392,20 @@ class ScoopWarpEnvV2(gym.Env):
         ctrl[: self.NUM_DOFS] = targets
         self._control.joint_target_pos.assign(ctrl)
 
-        # Robot dynamics — multiple substeps for stability
+        # Interleave one robot substep with one MPM substep so that each MPM
+        # step sees a body_q that advanced by exactly sim_dt.  With finite_difference
+        # mode this means velocity = Δbody_q / sim_dt = exact scoop velocity (no N×
+        # overestimate).  The smaller sim_dt per MPM step also cuts tunneling risk
+        # by sim_substeps× vs running all MPM steps after a full-frame robot advance.
         for _ in range(self.cfg.sim_substeps):
             self._state0.clear_forces()
             self._robot_solver.step(self._state0, self._state1, self._control, contacts=None, dt=self._sim_dt)
             self._state0, self._state1 = self._state1, self._state0
-
-        # MPM step — uses state0.body_q that SolverMuJoCo just updated (zero lag)
-        self._mpm_solver.step(self._state0, self._state0, contacts=None, control=None, dt=self._control_dt)
+            # Project particles that tunnelled through the scoop back outside before
+            # the grid-level solve.  body_q_prev holds the pre-robot-step position
+            # so the velocity estimate remains correct.
+            self._mpm_solver._project_outside(self._state0, self._state0, self._sim_dt)
+            self._mpm_solver.step(self._state0, self._state0, contacts=None, control=None, dt=self._sim_dt)
 
         self._step_count += 1
         self._sim_time += self._control_dt
