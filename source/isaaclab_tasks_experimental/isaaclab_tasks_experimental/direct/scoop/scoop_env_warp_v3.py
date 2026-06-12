@@ -5,8 +5,6 @@
 
 """Isaac-Scoop-Direct-Warp-v3: standalone self-contained environment.
 
-This module does not import from scoop_env_warp.py. All base environment code
-(constants, Warp kernels, ScoopWarpEnvCfg, ScoopWarpEnv) is inlined here.
 The only intra-package dependency is sand_mpm.py.
 
 Differences from v0/v1

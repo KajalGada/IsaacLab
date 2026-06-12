@@ -30,7 +30,7 @@ from newton.solvers import SolverImplicitMPM
 from isaaclab.utils import configclass
 
 # ---------------------------------------------------------------------------
-# Scene geometry constants (must match scoop_env_warp._BOX_PIECES)
+# Scene geometry constants (must match _BOX_PIECES in scoop_env_warp_v1.py / scoop_env_warp_v3.py)
 # ---------------------------------------------------------------------------
 
 _BOX_W = 0.35
@@ -651,7 +651,7 @@ class SandMPMHelper:
         discontinuously — e.g. the first MPM step after an episode reset, where the
         robot teleports from its end-of-episode pose to the new hover pose.
 
-        Call pattern in scoop_env_warp._post_step_visualize():
+        Call pattern in _post_step_visualize():
             if reset_happened_last_step:
                 self._sand.reinit_collider()   # body_q_prev = current hover pose
             self._sand.step(...)               # velocity = (hover+δ − hover)/dt ≈ 0 ✓

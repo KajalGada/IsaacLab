@@ -3,11 +3,14 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""UR5+scoop direct RL environment for sand scooping using Newton MuJoCo-Warp physics.
+"""Isaac-Scoop-Direct-Warp-v1: standalone self-contained environment.
 
-Robot dynamics are handled by IsaacLab's MuJoCo-Warp backend. Sand particles are
-simulated in a separate Newton MPM model coupled one-way (robot body poses → MPM
-colliders each step). See sand_mpm.py for the MPM architecture.
+The only intra-package dependency is sand_mpm.py.
+
+Physics: Newton MuJoCo-Warp solver (robot) + separate Newton implicit MPM (sand),
+one-way coupled — scoop poses are copied to kinematic proxy bodies each step.
+Voxel size 0.02 m with default sand material parameters. Sandbox shifted via
+box_offset=(1.0, 0.1, 0.0).
 """
 
 from __future__ import annotations
@@ -245,7 +248,7 @@ def _reset_joints(
 
 
 @configclass
-class ScoopWarpEnvCfg(DirectRLEnvCfg):
+class ScoopWarpEnvCfgV1(DirectRLEnvCfg):
     # env
     episode_length_s: float = 10.0
     decimation: int = 2
@@ -308,8 +311,8 @@ class ScoopWarpEnvCfg(DirectRLEnvCfg):
     # robot
     robot: ArticulationCfg = UR5_SCOOP_CFG.replace(prim_path="/World/envs/env_.*/Robot")  # type: ignore[attr-defined]
 
-    # sand MPM — box position baked into _BOX_PIECES / SandMPMCfg defaults
-    sand: SandMPMCfg = SandMPMCfg()
+    # sand MPM — sandbox shifted to the front of the robot (+x=1.0, +y=0.1)
+    sand: SandMPMCfg = SandMPMCfg(box_offset=(1.0, 0.1, 0.0))
 
     # task
     scoop_body_name: str = "scoop_link"
@@ -335,22 +338,15 @@ class ScoopWarpEnvCfg(DirectRLEnvCfg):
     action_smoothing: float = 0.2
 
 
-@configclass
-class ScoopWarpEnvCfgV1(ScoopWarpEnvCfg):
-    """v1: sandbox and particles shifted to the front of the robot (+x=1.0, +y=0.1)."""
-
-    sand: SandMPMCfg = SandMPMCfg(box_offset=(1.0, 0.1, 0.0))
-
-
 # ---------------------------------------------------------------------------
 # Environment implementation
 # ---------------------------------------------------------------------------
 
 
-class ScoopWarpEnv(DirectRLEnvWarp):
-    cfg: ScoopWarpEnvCfg
+class ScoopWarpEnvV1(DirectRLEnvWarp):
+    cfg: ScoopWarpEnvCfgV1
 
-    def __init__(self, cfg: ScoopWarpEnvCfg, render_mode: str | None = None, **kwargs):
+    def __init__(self, cfg: ScoopWarpEnvCfgV1, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
 
         # Scoop body index in the articulation body list
